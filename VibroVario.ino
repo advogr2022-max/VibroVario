@@ -1,4 +1,4 @@
-/* Версия 1.3 — исправления: LIFT_PULSES, FLIGHT_DETECT_VZ, CLOCK flight detect, motion tracking
+/* Версия 1.5 — FSM-rewrite: switch-case dispatcher, entry/exit actions, zero static locals
  * Прошивка ESP32 Вариометра
  * Основной функционал:
  * - Считывание данных с барометра BMP3XX и акселерометра (BMA).
@@ -97,23 +97,53 @@ const int   LIFT_PULSES[] = {1, 2, 3, 4};
 #define RTC_INT_PIN 27                  // PCF8563 INT (alarm wake)
 
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
-enum State { SLEEP, CLOCK, RUNNING, STOPPED, SETTINGS };
-RTC_DATA_ATTR State state = SLEEP;                    // Состояние сохраняется в RTC памяти при сне
-RTC_DATA_ATTR unsigned long stopwatchElapsed = 0;     // Накопленное время полета
-RTC_DATA_ATTR int lastWakeMinute = -1;                // Минута последнего пробуждения часов
-RTC_DATA_ATTR int lastWakeDay = -1;                   // День последнего пробуждения (для 1р/день)
-RTC_DATA_ATTR float altCheck = 0.0f;                  // Последняя высота для автостарта (RTC)
-RTC_DATA_ATTR unsigned long motionTime = 0;           // Счётчик wake-ов с движением (RTC)
-RTC_DATA_ATTR bool buzzerEnabled = true;               // Буззер включён (RTC)
-RTC_DATA_ATTR bool vibroEnabled = true;                // Вибро включён (RTC)
+enum FsmState { FSM_CLOCK, FSM_SETTINGS, FSM_CALIBRATING, FSM_RUNNING, FSM_STOPPED };
+RTC_DATA_ATTR FsmState fsmStateRTC = FSM_CLOCK;          // FSM состояние через deep sleep
+RTC_DATA_ATTR unsigned long stopwatchElapsed = 0;        // Накопленное время полета
+RTC_DATA_ATTR int lastWakeMinute = -1;                   // Минута последнего пробуждения часов
+RTC_DATA_ATTR int lastWakeDay = -1;                      // День последнего пробуждения (для 1р/день)
+RTC_DATA_ATTR float altCheck = 0.0f;                     // Последняя высота для автостарта (RTC)
+RTC_DATA_ATTR unsigned long motionTime = 0;              // Счётчик wake-ов с движением (RTC)
+RTC_DATA_ATTR bool buzzerEnabled = true;                 // Буззер включён (RTC)
+RTC_DATA_ATTR bool vibroEnabled = true;                  // Вибро включён (RTC)
+
+// Состояние вариометрной задачи — заменяет все static-переменные
+struct VarioFsm {
+    int pulses = 0;
+    bool pulseOn = false;
+    unsigned long nextT = 0;
+    bool pause = false;
+    bool vibroActive = false;
+    unsigned long vibroStopT = 0;
+    bool bzOn = false;
+    unsigned long bzNextT = 0;
+    unsigned long lastUpdateMicros = 0;
+    float vSmooth = 0.0f;
+    unsigned long lastActivity = 0;
+    void reset() {
+        pulses = 0; pulseOn = false; nextT = 0; pause = false;
+        vibroActive = false; vibroStopT = 0;
+        bzOn = false; bzNextT = 0;
+        lastUpdateMicros = micros();
+        vSmooth = 0.0f; lastActivity = 0;
+    }
+};
+
+// Runtime FSM данные (не RTC — сбрасываются при каждом wake)
+struct FsmRuntime {
+    FsmState state;
+    bool lastBtn[3];
+} fsm;
+
+VarioFsm vfsm;
 
 struct SysData {
   float startAlt, alt, vel, maxV, minV, temp;
   float ax, ay, az;
-  float gMagRef;                                        // Откалиброванное значение 1G (магнитуда)
+  float gMagRef;
   bool track, sensInit, accInit;
   unsigned long tStart, tScreen;
-  bool lastSt[3];                                     // Предыдущее состояние кнопок
+  bool lastSt[3];
 } data;
 
 int rtc_h, rtc_m, rtc_d, rtc_mon;
@@ -362,32 +392,20 @@ void drawItem(int x, int y, const GFXfont* f, String txt) {
 }
 
 // --- ЗАДАЧА ВАРИОМЕТРА (FreeRTOS Task) ---
-// Обрабатывает сенсоры с высокой частотой и управляет вибросигналом
+// Все состояния хранятся в vfsm (VarioFsm), не в static locals
 void varioTask(void *p) {
-    int pulses = 0;
-    bool pulseOn = false;
-    unsigned long nextT = 0;
-    bool pause = false;
-
-    bool vibroActive = false;
-    unsigned long vibroStopT = 0;
-    unsigned long lastUpdateMicros = micros();
-
-    float v_smooth = 0.0f;
-
     for(;;) {
-        if (state == RUNNING && data.sensInit) {
+        if (fsmStateRTC == FSM_RUNNING && data.sensInit) {
             float ax = 0.0f, ay = 0.0f, az = 0.0f;
             float acc_lin_ms2 = 0.0f;
 
             unsigned long nowMicros = micros();
-            float dt = (nowMicros - lastUpdateMicros) / 1000000.0f;
+            float dt = (nowMicros - vfsm.lastUpdateMicros) / 1000000.0f;
             if (dt < 0.001f) dt = 0.001f;
             if (dt > 0.1f)   dt = 0.1f;
-            lastUpdateMicros = nowMicros;
+            vfsm.lastUpdateMicros = nowMicros;
 
-            // Защита от чтения акселерометра во время работы вибромотора (шум)
-            bool accSafe = !vibroActive && (millis() - vibroStopT > VIBRO_COOLDOWN_MS);
+            bool accSafe = !vfsm.vibroActive && (millis() - vfsm.vibroStopT > VIBRO_COOLDOWN_MS);
 
             if (data.accInit && accSafe) {
                 Wire.beginTransmission(ADDR_BMA); Wire.write(0x12); Wire.endTransmission();
@@ -400,23 +418,17 @@ void varioTask(void *p) {
                     ay = ry / 8192.0f;
                     az = rz / 8192.0f;
 
-                    // Магнитуда — для оценки турбулентности
                     float acc_mag = sqrtf(ax*ax + ay*ay + az*az);
                     float acc_linear_g = acc_mag - data.gMagRef;
                     if (fabsf(acc_linear_g) < 0.02f) acc_linear_g = 0.0f;
                     acc_lin_ms2 = acc_linear_g * GRAVITY_G;
-                    // azLinMs2 больше не храним — фильтр сам вычисляет
-                    // проекцию на gravity vector из сырых ax, ay, az
                 }
             }
 
             if (bmp.performReading()) {
                 float baro_alt = bmp.readAltitude(SEALEVELPRESSURE_HPA);
-
-                // Обновление фильтра: сырые ax,ay,az (G), магнитуда (м/с²), baroAlt, dt
                 float v = varioEMA.update(ax, ay, az, acc_lin_ms2, baro_alt, dt);
 
-                // Обновление глобальных данных (в критической секции)
                 portENTER_CRITICAL(&mux);
                 data.alt  = varioEMA.getAltitude();
                 data.vel  = v;
@@ -429,15 +441,14 @@ void varioTask(void *p) {
                     if (data.vel < data.minV) data.minV = data.vel;
                 }
 
-                v_smooth += (data.vel - v_smooth) * 0.2f; // Дополнительное сглаживание для логики звука
+                vfsm.vSmooth += (data.vel - vfsm.vSmooth) * 0.2f;
 
                 // --- ЛОГИКА ГЕНЕРАЦИИ ИМПУЛЬСОВ ---
                 int reqP = 0;
-                float v_check = v_smooth;
+                float v_check = vfsm.vSmooth;
 
-                if (v_check <= SINK_TRH) reqP = -1; // Сильное снижение
+                if (v_check <= SINK_TRH) reqP = -1;
                 else {
-                    // Определение количества импульсов по порогам подъема
                     for (int i = 0; i < 4; i++)
                         if (v_check >= LIFT_TH[i] && v_check < LIFT_TH[i+1])
                             reqP = LIFT_PULSES[i];
@@ -447,86 +458,72 @@ void varioTask(void *p) {
                 bool setVibro = false;
 
                 if (reqP == -1) {
-                    // Непрерывный сигнал при снижении
-                    setVibro = true; pulses = 0; pulseOn = 1; pause = 0;
+                    setVibro = true; vfsm.pulses = 0; vfsm.pulseOn = true; vfsm.pause = false;
                 } else if (reqP == 0) {
-                    // Тишина
-                    setVibro = false; pulses = 0; pulseOn = 0; pause = 0;
+                    setVibro = false; vfsm.pulses = 0; vfsm.pulseOn = false; vfsm.pause = false;
                 } else {
-                    // Генерация пачек импульсов
-                    if (pulses == 0 && !pulseOn && !pause) {
-                         pulses = reqP; setVibro = true; pulseOn = 1; nextT = now + V_PULSE;
+                    if (vfsm.pulses == 0 && !vfsm.pulseOn && !vfsm.pause) {
+                         vfsm.pulses = reqP; setVibro = true; vfsm.pulseOn = true;
+                         vfsm.nextT = now + V_PULSE;
                     }
-                    if (now >= nextT) {
-                        if (pulseOn) {
-                            setVibro = false; pulseOn = 0; pulses--;
-                            nextT = now + (pulses > 0 ? V_GAP : V_PAUSE);
-                            if(pulses <= 0) pause = true;
+                    if (now >= vfsm.nextT) {
+                        if (vfsm.pulseOn) {
+                            setVibro = false; vfsm.pulseOn = false; vfsm.pulses--;
+                            vfsm.nextT = now + (vfsm.pulses > 0 ? V_GAP : V_PAUSE);
+                            if(vfsm.pulses <= 0) vfsm.pause = true;
                         } else {
-                            if (pause) pause = false;
-                            else { setVibro = true; pulseOn = 1; nextT = now + V_PULSE; }
+                            if (vfsm.pause) vfsm.pause = false;
+                            else { setVibro = true; vfsm.pulseOn = true; vfsm.nextT = now + V_PULSE; }
                         }
-                    } else { setVibro = pulseOn; }
+                    } else { setVibro = vfsm.pulseOn; }
                 }
 
-                // Управление физическим пином
+                // Управление вибро
                 if (setVibro && vibroEnabled) {
-                    digitalWrite(PIN_VIBRO, 1); vibroActive = true;
+                    digitalWrite(PIN_VIBRO, 1); vfsm.vibroActive = true;
                 } else {
                     digitalWrite(PIN_VIBRO, 0);
-                    if (vibroActive) vibroStopT = millis(); // Запомнить момент остановки для защиты акселерометра
-                    vibroActive = false;
+                    if (vfsm.vibroActive) vfsm.vibroStopT = millis();
+                    vfsm.vibroActive = false;
                 }
 
-                // --- БУЗЗЕР: Brauneiger-style тональность ---
-                // Частота и каденция пропорциональны Vz
-                // Тихая зона: ±0.3 м/с
-                // Pulse/pause = 1:1, как у Brauneiger IQ
-                static bool bzOn = false;
-                static unsigned long bzNextT = 0;
+                // --- БУЗЗЕР ---
                 unsigned long bzNow = millis();
-
-                float bzV = v_smooth;
+                float bzV = vfsm.vSmooth;
                 if (buzzerEnabled) {
                     if (bzV >= BZ_SILENT_MAX) {
-                        // --- ПОДЪЁМ: возрастающий тон + ускорение бипов ---
                         float climbRate = bzV;
                         if (climbRate > 8.0f) climbRate = 8.0f;
-
                         int freq = BZ_CLIMB_BASE + (int)(climbRate * BZ_CLIMB_MOD);
                         if (freq > BZ_CLIMB_MAX) freq = BZ_CLIMB_MAX;
-
                         int beatMs = BZ_BEAT_BASE / (1.0f + (climbRate - BZ_SILENT_MAX) * BZ_BEAT_RATE);
                         if (beatMs < BZ_BEAT_MIN) beatMs = BZ_BEAT_MIN;
-
-                        if (bzNow >= bzNextT) {
-                            bzOn = !bzOn;
-                            bzNextT = bzNow + beatMs / 2;
-                            if (bzOn) {
+                        if (bzNow >= vfsm.bzNextT) {
+                            vfsm.bzOn = !vfsm.bzOn;
+                            vfsm.bzNextT = bzNow + beatMs / 2;
+                            if (vfsm.bzOn) {
                                 ledcChangeFrequency(BUZZER_PIN, freq, 8);
                                 ledcWrite(BUZZER_PIN, 128);
                             } else {
                                 ledcWrite(BUZZER_PIN, 0);
                             }
                         }
-
                     } else if (bzV <= BZ_SILENT_MIN) {
                         float sinkRate = -bzV;
                         if (sinkRate > 5.0f) sinkRate = 5.0f;
                         int freq = BZ_SINK_FREQ;
-
                         if (sinkRate >= (-BZ_SINK_ALARM)) {
                             ledcChangeFrequency(BUZZER_PIN, freq, 8);
                             ledcWrite(BUZZER_PIN, 128);
-                            bzOn = true;
-                            bzNextT = 0;
+                            vfsm.bzOn = true;
+                            vfsm.bzNextT = 0;
                         } else {
                             int beatMs = 800 - (int)(sinkRate * 100);
                             if (beatMs < 200) beatMs = 200;
-                            if (bzNow >= bzNextT) {
-                                bzOn = !bzOn;
-                                bzNextT = bzNow + beatMs / 2;
-                                if (bzOn) {
+                            if (bzNow >= vfsm.bzNextT) {
+                                vfsm.bzOn = !vfsm.bzOn;
+                                vfsm.bzNextT = bzNow + beatMs / 2;
+                                if (vfsm.bzOn) {
                                     ledcChangeFrequency(BUZZER_PIN, freq, 8);
                                     ledcWrite(BUZZER_PIN, 128);
                                 } else {
@@ -534,23 +531,18 @@ void varioTask(void *p) {
                                 }
                             }
                         }
-
                     } else {
-                        if (bzOn) {
-                            ledcWrite(BUZZER_PIN, 0);
-                            bzOn = false;
-                        }
-                        bzNextT = 0;
+                        if (vfsm.bzOn) { ledcWrite(BUZZER_PIN, 0); vfsm.bzOn = false; }
+                        vfsm.bzNextT = 0;
                     }
                 } else {
-                    // Буззер отключён — гарантированно тишина
-                    if (bzOn) { ledcWrite(BUZZER_PIN, 0); bzOn = false; }
-                    bzNextT = 0;
+                    if (vfsm.bzOn) { ledcWrite(BUZZER_PIN, 0); vfsm.bzOn = false; }
+                    vfsm.bzNextT = 0;
                 }
             }
         } else {
             digitalWrite(PIN_VIBRO, 0);
-            ledcWrite(BUZZER_PIN, 0); // Выкл буззер в неактивном состоянии
+            ledcWrite(BUZZER_PIN, 0);
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000/LOOP_HZ));
@@ -571,7 +563,7 @@ void drawMain() {
         display.setTextColor(GxEPD_BLACK);
 
         // Время полета
-        unsigned long t = stopwatchElapsed + (state==RUNNING ? (millis()-data.tStart)/1000 : 0);
+        unsigned long t = stopwatchElapsed + (fsmStateRTC == FSM_RUNNING ? (millis()-data.tStart)/1000 : 0);
         sprintf(buf, "%02lu:%02lu:%02lu", t/3600, (t%3600)/60, t%60);
         drawItem(10, 20, &FreeSansBold9pt7b, buf);
 
@@ -582,7 +574,7 @@ void drawMain() {
         sprintf(buf, "%d%%", v>=4.2?100 : (v<=3.3?0 : (int)((v-3.3)*111.1)));
         drawItem(140, 20, &FreeSansBold9pt7b, buf);
 
-        if(state==RUNNING || state==STOPPED) {
+        if(fsmStateRTC == FSM_RUNNING || fsmStateRTC == FSM_STOPPED) {
             drawItem(25, 50, &FreeSansBold9pt7b, "Start, m   Sea, m");
             sprintf(buf, "%+d", (int)(dAlt - data.startAlt));
             drawItem(30, 90, &FreeSansBold18pt7b, buf);
@@ -687,11 +679,14 @@ void startFlight() {
         stopwatchElapsed = 0;
         data.tStart = millis();
         if(!vTaskH) xTaskCreatePinnedToCore(varioTask, "V", 4096, NULL, 10, &vTaskH, 0);
-        state = RUNNING;
+        vfsm.reset();
+        fsm.state = FSM_RUNNING;
+        fsmStateRTC = FSM_RUNNING;
     }
 }
 
 void goDeepSleep() {
+    fsmStateRTC = fsm.state;
     if(vTaskH) vTaskDelete(vTaskH);
     digitalWrite(PIN_VARIO_EN, 0); digitalWrite(PIN_VIBRO, 0);
     ledcWrite(BUZZER_PIN, 0);
@@ -729,6 +724,9 @@ void setup() {
 
     readRTC();
 
+    // Восстанавливаем runtime FSM state из RTC
+    fsm.state = fsmStateRTC;
+
     // Определяем причину пробуждения
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     uint64_t wakePin = 0;
@@ -736,24 +734,26 @@ void setup() {
         wakePin = esp_sleep_get_ext1_wakeup_status();
     }
 
-    if (state == RUNNING && cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
-        // Проснулись во время полёта (например от BMA motion) — продолжаем полёт
-        // Это нештатная ситуация, идём в CLOCK
-        state = CLOCK;
+    if (fsmStateRTC == FSM_RUNNING && cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
+        // Проснулись во время полёта — нештатная ситуация, идём в CLOCK
+        fsmStateRTC = FSM_CLOCK;
+        fsm.state = FSM_CLOCK;
     }
 
-    if (state == SLEEP || state == CLOCK) {
+    if (fsmStateRTC == FSM_CLOCK) {
         if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
             // Первый запуск после подачи питания — показываем часы
             drawClock(true);
-            state = CLOCK;
-            // Идём в loop(), который сразу уложит спать
+            fsmStateRTC = FSM_CLOCK;
+            fsm.state = FSM_CLOCK;
+            // Идём в loop()
         }
         else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
             if (wakePin & BIT64(BTN_UP)) {
-                // Пробуждение по кнопке BACK — показываем часы
+                // Пробуждение по кнопке UP — показываем часы
                 drawClock(true);
-                state = CLOCK;
+                fsmStateRTC = FSM_CLOCK;
+                fsm.state = FSM_CLOCK;
             }
             else if (wakePin & BIT64(RTC_INT_PIN)) {
                 // Пробуждение по RTC alarm (раз в минуту)
@@ -772,10 +772,9 @@ void setup() {
                     bmp.setOutputDataRate(BMP3_ODR_50_HZ);
                     if (bmp.performReading()) {
                         float altNow = bmp.readAltitude(SEALEVELPRESSURE_HPA);
-                        float vz = (altNow - altCheck) / 60.0f;  // Vz за минуту
+                        float vz = (altNow - altCheck) / 60.0f;
                         altCheck = altNow;
                         if (vz > FLIGHT_DETECT_VZ) {
-                            // Набор высоты — полёт!
                             display.setPartialWindow(0,0,200,200);
                             display.firstPage();
                             do {
@@ -790,236 +789,215 @@ void setup() {
                 } else {
                     digitalWrite(PIN_VARIO_EN, 0);
                 }
-                // Если полёт не обнаружен — идём в loop(), который уложит спать
-                if (state != RUNNING) state = CLOCK;
+                fsmStateRTC = FSM_CLOCK;
+                fsm.state = FSM_CLOCK;
             }
             else if (wakePin & BIT64(ACC_INT_1_PIN)) {
-                // Пробуждение по движению — показываем часы и ждём
+                // Пробуждение по движению
                 drawClock(true);
-                state = CLOCK;
+                fsmStateRTC = FSM_CLOCK;
+                fsm.state = FSM_CLOCK;
             }
         }
-    } else if (state == STOPPED) {
+    } else if (fsmStateRTC == FSM_STOPPED) {
         drawMain();
     }
 
-    if (state == RUNNING) {
+    if (fsmStateRTC == FSM_RUNNING) {
         // Восстановление после глубокого сна в RUNNING — переходим в CLOCK
-        state = CLOCK;
+        fsm.state = FSM_CLOCK;
+        fsmStateRTC = FSM_CLOCK;
         drawClock(true);
     }
 }
 
 void loop() {
-    // === CLOCK MODE: сон с RTC alarm ===
-    if (state == CLOCK) {
-        // Определяем: было движение?
-        bool hadMotion = false;
-        uint64_t pin = 0;
-        esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-        if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-            pin = esp_sleep_get_ext1_wakeup_status();
-            hadMotion = (pin & BIT64(ACC_INT_1_PIN));
-        }
+    // === FSM TICK ===
+    bool btn[3] = { digitalRead(BTN_DOWN), digitalRead(BTN_OK), digitalRead(BTN_UP) };
+    bool anyBtn = btn[0] || btn[1] || btn[2];
+    unsigned long now = millis();
 
-        // Обнуляем motionTime при первом пробуждении
-        if (lastWakeMinute < 0) motionTime = 0;
-
-        if (hadMotion) motionTime++;
-        else motionTime = 0;  // Нет движения — сбрасываем счётчик
-
-        // Сброс altCheck при wake от кнопки (человек взял часы в руки)
-        if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-            if (pin & (BIT64(BTN_OK) | BIT64(BTN_UP))) {
-                altCheck = 0.0f;  // Сброс — перепроверим при следующем RTC wake
-            }
-        }
-
-        // Читаем кнопки перед сном
-        bool up = digitalRead(BTN_UP);
-        bool ok = digitalRead(BTN_OK);
-        bool down = digitalRead(BTN_DOWN);
-
-        // DOWN → настройки
-        if (down && !data.lastSt[0]) {
+    // Debounce: detection on rising edge
+    bool press[3] = { false, false, false };
+    for (int i = 0; i < 3; i++) {
+        if (btn[i] && !fsm.lastBtn[i]) {
             delay(50);
-            if(digitalRead(BTN_DOWN)) {
-                state = SETTINGS;
-                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
-                drawSettings();
-                return;
+            if (digitalRead(i == 0 ? BTN_DOWN : (i == 1 ? BTN_OK : BTN_UP))) {
+                press[i] = true;
             }
         }
-        // OK → старт полёта
-        if (ok && !data.lastSt[1]) {
-            delay(50);
-            if(digitalRead(BTN_OK)) {
-                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
-                startFlight();
-                return;
-            }
-        }
-        // UP → сейчаc в сон (24ч)
-        if (up && !data.lastSt[2]) {
-            delay(50);
-            if(digitalRead(BTN_UP)) {
-                setRTCAlarmSec(CLOCK_SLEEP_STILL);
-                initBMAMotionWake();
-                goDeepSleep();
-            }
-        }
-
-        data.lastSt[0]=down; data.lastSt[1]=ok; data.lastSt[2]=up;
-
-        // Если нет движения 15+ мин — спим сутки
-        bool stillEnough = (motionTime >= 15) || (!hadMotion && lastWakeMinute >= 0);
-        int sleepSec = stillEnough ? CLOCK_SLEEP_STILL : CLOCK_SLEEP_MOTION;
-        setRTCAlarmSec(sleepSec);
-        initBMAMotionWake();
-        goDeepSleep();
+        fsm.lastBtn[i] = btn[i];
     }
 
-    // === SLEEP: только по кнопке ===
-    if (state == SLEEP) {
-        goDeepSleep();
-    }
+    // FSM dispatcher
+    switch (fsm.state) {
 
-    // === SETTINGS: экран настроек ===
-    if (state == SETTINGS) {
-        bool up = digitalRead(BTN_UP);
-        bool ok = digitalRead(BTN_OK);
-        bool down = digitalRead(BTN_DOWN);
-
-        // OK — toggle текущей настройки
-        if (ok && !data.lastSt[1]) {
-            delay(50);
-            if(digitalRead(BTN_OK)) {
-                // Просто циклический toggle: buzzer → vibro → buzzer → ...
-                if (!buzzerEnabled || !vibroEnabled) {
-                    if (!buzzerEnabled) buzzerEnabled = true;
-                    else if (!vibroEnabled) vibroEnabled = true;
-                } else {
-                    buzzerEnabled = false;
-                }
-                drawSettings();
-                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
-                return;
-            }
+    case FSM_CLOCK: {
+        // DOWN → settings
+        if (press[0]) {
+            fsm.state = FSM_SETTINGS;
+            drawSettings();
+            return;
         }
-        // DOWN — сбросить всё в ON
-        if (down && !data.lastSt[0]) {
-            delay(50);
-            if(digitalRead(BTN_DOWN)) {
-                buzzerEnabled = true;
-                vibroEnabled = true;
-                drawSettings();
-                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
-                return;
-            }
-        }
-        // UP — выход в CLOCK
-        if (up && !data.lastSt[2]) {
-            delay(50);
-            if(digitalRead(BTN_UP)) {
-                readRTC(); drawClock(true);
-                state = CLOCK;
-                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
-                return;
-            }
-        }
-
-        data.lastSt[0]=down; data.lastSt[1]=ok; data.lastSt[2]=up;
-        delay(50);
-        return;
-    }
-
-    // === RUNNING/STOPPED: варио режим ===
-    if (state == RUNNING && !vTaskH) {
-        // Автостарт при обнаружении полёта из setup()
-        // или повторный вход в RUNNING
-        state = CLOCK; // Сброс — пользователь нажмёт Select
-        drawClock(true);
-        return;
-    }
-
-    bool bSel = digitalRead(BTN_DOWN);
-    bool bR   = digitalRead(BTN_OK);
-    bool bBack= digitalRead(BTN_UP);
-
-    if (bBack && !data.lastSt[2]) {
-        delay(50);
-        if(digitalRead(BTN_UP)) {
-            if (state == RUNNING || state == STOPPED) {
-                readRTC(); drawClock(true); state = CLOCK;
-                // loop() захватит CLOCK на следующей итерации и уйдёт в сон
-                return;
-            }
-        }
-    }
-
-    // Старт полета — из STOPPED или SLEEP (CLOCK обрабатывается выше)
-    if ((bSel || bR) && (state == STOPPED || state == SLEEP)) {
-        delay(50);
-        if(digitalRead(BTN_DOWN) || digitalRead(BTN_OK)) {
+        // OK → start flight
+        if (press[1]) {
+            fsm.state = FSM_CALIBRATING;
             startFlight();
+            return;
         }
-    }
-
-    // Сброс времени или стоп полета (Right)
-    if (bR && !data.lastSt[1]) {
-        delay(50);
-        if(digitalRead(BTN_OK)) {
-            if (state==RUNNING) {
-                stopwatchElapsed += (millis()-data.tStart)/1000;
-                state=STOPPED;
-                digitalWrite(PIN_VIBRO, 0);
-            } else if (state==CLOCK || state==STOPPED) {
-                // Сброс RTC в 00:00
-                i2cWrite(ADDR_RTC, 0x02, 0);
-                i2cWrite(ADDR_RTC, 0x03, 0);
-                i2cWrite(ADDR_RTC, 0x04, 0);
-                rtc_h=0; rtc_m=0; drawClock(false);
-            }
+        // UP → deep sleep (24h)
+        if (press[2]) {
+            setRTCAlarmSec(CLOCK_SLEEP_STILL);
+            initBMAMotionWake();
+            goDeepSleep();
         }
-    }
-
-    data.lastSt[0]=bSel; data.lastSt[1]=bR; data.lastSt[2]=bBack;
-
-    // Автоопределение посадки: Vz ≈ 0 и нет движения
-    if (state == RUNNING && data.track && (millis() - data.tStart > 10000)) {
-        static unsigned long lastActivity = 0;
-        float vel = 0;
-        portENTER_CRITICAL(&mux);
-        vel = data.vel;
-        portEXIT_CRITICAL(&mux);
-        float ax, ay;
-        portENTER_CRITICAL(&mux);
-        ax = data.ax;
-        ay = data.ay;
-        portEXIT_CRITICAL(&mux);
-        if (fabsf(vel) < LANDING_DETECT_VZ && fabsf(ax) < 0.1f && fabsf(ay) < 0.1f) {
-            if (lastActivity == 0) lastActivity = millis();
-            if ((millis() - lastActivity) > (LANDING_DETECT_SEC * 1000UL)) {
-                // Посадка! Переходим в CLOCK
-                stopwatchElapsed += (millis()-data.tStart)/1000;
-                if(vTaskH) { vTaskDelete(vTaskH); vTaskH = NULL; }
-                digitalWrite(PIN_VARIO_EN, 0);
-                digitalWrite(PIN_VIBRO, 0);
-                ledcWrite(BUZZER_PIN, 0);
-                readRTC(); drawClock(true);
-                state = CLOCK;
-                return;
+        // No button → motion logic + deep sleep
+        if (!anyBtn) {
+            bool hadMotion = false;
+            uint64_t pin = 0;
+            esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+            if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+                pin = esp_sleep_get_ext1_wakeup_status();
+                hadMotion = (pin & BIT64(ACC_INT_1_PIN));
             }
+            if (lastWakeMinute < 0) motionTime = 0;
+            if (hadMotion) motionTime++;
+            else motionTime = 0;
+            if (cause == ESP_SLEEP_WAKEUP_EXT1 && (pin & (BIT64(BTN_OK) | BIT64(BTN_UP)))) {
+                altCheck = 0.0f;
+            }
+            bool stillEnough = (motionTime >= 15) || (!hadMotion && lastWakeMinute >= 0);
+            int sleepSec = stillEnough ? CLOCK_SLEEP_STILL : CLOCK_SLEEP_MOTION;
+            setRTCAlarmSec(sleepSec);
+            initBMAMotionWake();
+            goDeepSleep();
         } else {
-            lastActivity = 0; // Есть движение — сбрасываем таймер посадки
+            // Button was pressed but not handled (shouldn't happen) — sleep anyway
+            setRTCAlarmSec(CLOCK_SLEEP_MOTION);
+            initBMAMotionWake();
+            goDeepSleep();
         }
+        break;
     }
 
-    if(state == RUNNING && !data.track && (millis() - data.tStart > 5000)) data.track = true;
+    case FSM_SETTINGS:
+        if (press[1]) { // OK — toggle
+            if (!buzzerEnabled || !vibroEnabled) {
+                if (!buzzerEnabled) buzzerEnabled = true;
+                else if (!vibroEnabled) vibroEnabled = true;
+            } else {
+                buzzerEnabled = false;
+            }
+            drawSettings();
+            return;
+        }
+        if (press[0]) { // DOWN — reset all to ON
+            buzzerEnabled = true; vibroEnabled = true;
+            drawSettings();
+            return;
+        }
+        if (press[2]) { // UP — exit to clock
+            readRTC(); drawClock(true);
+            fsm.state = FSM_CLOCK;
+            return;
+        }
+        delay(50);
+        break;
 
-    // Обновление экрана
-    if ((state == RUNNING || state == STOPPED) && (millis() - data.tScreen >= REFRESH_MS)) {
-        data.tScreen = millis(); drawMain();
+    case FSM_CALIBRATING:
+        // startFlight() handled calibration and set RUNNING.
+        // If we're still here, calibration failed or was never called.
+        fsm.state = FSM_CLOCK;
+        drawClock(true);
+        break;
+
+    case FSM_RUNNING: {
+        // Ensure vario task exists
+        if (!vTaskH) {
+            fsm.state = FSM_CLOCK;
+            drawClock(true);
+            return;
+        }
+        // UP → stop flight, back to clock
+        if (press[2]) {
+            if(vTaskH) { vTaskDelete(vTaskH); vTaskH = NULL; }
+            digitalWrite(PIN_VARIO_EN, 0);
+            digitalWrite(PIN_VIBRO, 0);
+            ledcWrite(BUZZER_PIN, 0);
+            vfsm.reset();
+            readRTC(); drawClock(true);
+            fsm.state = FSM_CLOCK;
+            return;
+        }
+        // OK → stop flight, show stats
+        if (press[1]) {
+            stopwatchElapsed += (now - data.tStart) / 1000;
+            fsm.state = FSM_STOPPED;
+            digitalWrite(PIN_VIBRO, 0);
+            return;
+        }
+        // Auto landing detection
+        if (data.track && (now - data.tStart > 10000)) {
+            float vel = 0, ax = 0, ay = 0;
+            portENTER_CRITICAL(&mux);
+            vel = data.vel; ax = data.ax; ay = data.ay;
+            portEXIT_CRITICAL(&mux);
+            if (fabsf(vel) < LANDING_DETECT_VZ && fabsf(ax) < 0.1f && fabsf(ay) < 0.1f) {
+                if (vfsm.lastActivity == 0) vfsm.lastActivity = now;
+                if ((now - vfsm.lastActivity) > (LANDING_DETECT_SEC * 1000UL)) {
+                    stopwatchElapsed += (now - data.tStart) / 1000;
+                    if(vTaskH) { vTaskDelete(vTaskH); vTaskH = NULL; }
+                    digitalWrite(PIN_VARIO_EN, 0);
+                    digitalWrite(PIN_VIBRO, 0);
+                    ledcWrite(BUZZER_PIN, 0);
+                    vfsm.reset();
+                    readRTC(); drawClock(true);
+                    fsm.state = FSM_CLOCK;
+                    return;
+                }
+            } else {
+                vfsm.lastActivity = 0;
+            }
+        }
+        // Enable tracking after 5 sec
+        if (!data.track && (now - data.tStart > 5000)) data.track = true;
+        // Screen refresh
+        if (now - data.tScreen >= REFRESH_MS) {
+            data.tScreen = now; drawMain();
+        }
+        delay(10);
+        break;
     }
-    delay(10);
+
+    case FSM_STOPPED:
+        if (press[2]) { // UP → clock
+            if(vTaskH) { vTaskDelete(vTaskH); vTaskH = NULL; }
+            digitalWrite(PIN_VARIO_EN, 0);
+            digitalWrite(PIN_VIBRO, 0);
+            ledcWrite(BUZZER_PIN, 0);
+            vfsm.reset();
+            readRTC(); drawClock(true);
+            fsm.state = FSM_CLOCK;
+            return;
+        }
+        if (press[1]) { // OK — reset RTC to 00:00
+            i2cWrite(ADDR_RTC, 0x02, 0);
+            i2cWrite(ADDR_RTC, 0x03, 0);
+            i2cWrite(ADDR_RTC, 0x04, 0);
+            rtc_h = 0; rtc_m = 0;
+            drawClock(false);
+            fsm.state = FSM_CLOCK;
+            return;
+        }
+        if (press[0]) { // DOWN → new flight
+            startFlight();
+            return;
+        }
+        // Screen refresh
+        if (now - data.tScreen >= REFRESH_MS) {
+            data.tScreen = now; drawMain();
+        }
+        delay(10);
+        break;
+    }
 }
