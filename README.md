@@ -1,8 +1,11 @@
-# VibroVarioAuto v1.2
+# VibroVarioAuto v1.5b
 
 **Автоматический вариометр для параплана на ESP32 Watchy**
 
 Вибрация + звук (Brauneiger-style) + комплементарный фильтр (IMU+Baro) + энергосбережение.
+
+Форк/порт оригинального [VibroVario](https://github.com/isemaster/VibroVario) от isemaster.
+Оригинал — ESP32 Watchy, BMP390, BMA423, E-Ink 1.54".
 
 ![Watchy](media/watchy.jpeg)
 

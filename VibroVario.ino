@@ -1,5 +1,6 @@
-/* Версия 1.5 — FSM-rewrite: switch-case dispatcher, entry/exit actions, zero static locals
+/* Версия 1.5b — English cross-reference comments, FSM transition docs
  * Прошивка ESP32 Вариометра
+ * Форк/порт оригинального VibroVario (github.com/isemaster/VibroVario)
  * Основной функционал:
  * - Считывание данных с барометра BMP3XX и акселерометра (BMA).
  * - Fusion-фильтрация (EMA) данных для быстрого отклика вариометра.
