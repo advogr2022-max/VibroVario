@@ -97,13 +97,15 @@ const int   LIFT_PULSES[] = {1, 2, 3, 4};
 #define RTC_INT_PIN 27                  // PCF8563 INT (alarm wake)
 
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
-enum State { SLEEP, CLOCK, RUNNING, STOPPED, CALIB };
+enum State { SLEEP, CLOCK, RUNNING, STOPPED, SETTINGS };
 RTC_DATA_ATTR State state = SLEEP;                    // Состояние сохраняется в RTC памяти при сне
 RTC_DATA_ATTR unsigned long stopwatchElapsed = 0;     // Накопленное время полета
 RTC_DATA_ATTR int lastWakeMinute = -1;                // Минута последнего пробуждения часов
 RTC_DATA_ATTR int lastWakeDay = -1;                   // День последнего пробуждения (для 1р/день)
 RTC_DATA_ATTR float altCheck = 0.0f;                  // Последняя высота для автостарта (RTC)
 RTC_DATA_ATTR unsigned long motionTime = 0;           // Счётчик wake-ов с движением (RTC)
+RTC_DATA_ATTR bool buzzerEnabled = true;               // Буззер включён (RTC)
+RTC_DATA_ATTR bool vibroEnabled = true;                // Вибро включён (RTC)
 
 struct SysData {
   float startAlt, alt, vel, maxV, minV, temp;
@@ -468,7 +470,7 @@ void varioTask(void *p) {
                 }
 
                 // Управление физическим пином
-                if (setVibro) {
+                if (setVibro && vibroEnabled) {
                     digitalWrite(PIN_VIBRO, 1); vibroActive = true;
                 } else {
                     digitalWrite(PIN_VIBRO, 0);
@@ -484,50 +486,18 @@ void varioTask(void *p) {
                 static unsigned long bzNextT = 0;
                 unsigned long bzNow = millis();
 
-                float bzV = v_smooth; // используем то же сглаживание
+                float bzV = v_smooth;
+                if (buzzerEnabled) {
+                    if (bzV >= BZ_SILENT_MAX) {
+                        // --- ПОДЪЁМ: возрастающий тон + ускорение бипов ---
+                        float climbRate = bzV;
+                        if (climbRate > 8.0f) climbRate = 8.0f;
 
-                if (bzV >= BZ_SILENT_MAX) {
-                    // --- ПОДЪЁМ: возрастающий тон + ускорение бипов ---
-                    float climbRate = bzV;
-                    if (climbRate > 8.0f) climbRate = 8.0f;
+                        int freq = BZ_CLIMB_BASE + (int)(climbRate * BZ_CLIMB_MOD);
+                        if (freq > BZ_CLIMB_MAX) freq = BZ_CLIMB_MAX;
 
-                    // Частота: BZ_CLIMB_BASE + Vz * BZ_CLIMB_MOD (Гц на м/с)
-                    int freq = BZ_CLIMB_BASE + (int)(climbRate * BZ_CLIMB_MOD);
-                    if (freq > BZ_CLIMB_MAX) freq = BZ_CLIMB_MAX;
-
-                    // Длительность такта (1 бип + 1 пауза)
-                    int beatMs = BZ_BEAT_BASE / (1.0f + (climbRate - BZ_SILENT_MAX) * BZ_BEAT_RATE);
-                    if (beatMs < BZ_BEAT_MIN) beatMs = BZ_BEAT_MIN;
-
-                    // 1:1 pulse/pause — каждый такт flip
-                    if (bzNow >= bzNextT) {
-                        bzOn = !bzOn;
-                        bzNextT = bzNow + beatMs / 2;
-                        if (bzOn) {
-                            ledcChangeFrequency(BUZZER_PIN, freq, 8);
-                            ledcWrite(BUZZER_PIN, 128);
-                        } else {
-                            ledcWrite(BUZZER_PIN, 0);
-                        }
-                    }
-
-                } else if (bzV <= BZ_SILENT_MIN) {
-                    // --- СНИЖЕНИЕ: низкий тон, медленные бипы ---
-                    float sinkRate = -bzV;
-                    if (sinkRate > 5.0f) sinkRate = 5.0f;
-
-                    int freq = BZ_SINK_FREQ;
-
-                    if (sinkRate >= (-BZ_SINK_ALARM)) {
-                        // Аварийное снижение — непрерывный тон
-                        ledcChangeFrequency(BUZZER_PIN, freq, 8);
-                        ledcWrite(BUZZER_PIN, 128);
-                        bzOn = true;
-                        bzNextT = 0;
-                    } else {
-                        // Медленные бипы снижения
-                        int beatMs = 800 - (int)(sinkRate * 100);
-                        if (beatMs < 200) beatMs = 200;
+                        int beatMs = BZ_BEAT_BASE / (1.0f + (climbRate - BZ_SILENT_MAX) * BZ_BEAT_RATE);
+                        if (beatMs < BZ_BEAT_MIN) beatMs = BZ_BEAT_MIN;
 
                         if (bzNow >= bzNextT) {
                             bzOn = !bzOn;
@@ -539,14 +509,42 @@ void varioTask(void *p) {
                                 ledcWrite(BUZZER_PIN, 0);
                             }
                         }
-                    }
 
-                } else {
-                    // --- ТИХАЯ ЗОНА ---
-                    if (bzOn) {
-                        ledcWrite(BUZZER_PIN, 0);
-                        bzOn = false;
+                    } else if (bzV <= BZ_SILENT_MIN) {
+                        float sinkRate = -bzV;
+                        if (sinkRate > 5.0f) sinkRate = 5.0f;
+                        int freq = BZ_SINK_FREQ;
+
+                        if (sinkRate >= (-BZ_SINK_ALARM)) {
+                            ledcChangeFrequency(BUZZER_PIN, freq, 8);
+                            ledcWrite(BUZZER_PIN, 128);
+                            bzOn = true;
+                            bzNextT = 0;
+                        } else {
+                            int beatMs = 800 - (int)(sinkRate * 100);
+                            if (beatMs < 200) beatMs = 200;
+                            if (bzNow >= bzNextT) {
+                                bzOn = !bzOn;
+                                bzNextT = bzNow + beatMs / 2;
+                                if (bzOn) {
+                                    ledcChangeFrequency(BUZZER_PIN, freq, 8);
+                                    ledcWrite(BUZZER_PIN, 128);
+                                } else {
+                                    ledcWrite(BUZZER_PIN, 0);
+                                }
+                            }
+                        }
+
+                    } else {
+                        if (bzOn) {
+                            ledcWrite(BUZZER_PIN, 0);
+                            bzOn = false;
+                        }
+                        bzNextT = 0;
                     }
+                } else {
+                    // Буззер отключён — гарантированно тишина
+                    if (bzOn) { ledcWrite(BUZZER_PIN, 0); bzOn = false; }
                     bzNextT = 0;
                 }
             }
@@ -619,6 +617,78 @@ void drawClock(bool deep) {
         sprintf(buf, "%02d.%02d", rtc_d, rtc_mon);
         drawItem(-1, 160, &FreeSansBold18pt7b, buf);
     } while (display.nextPage());
+}
+
+void drawSettings() {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setTextColor(GxEPD_BLACK);
+        drawItem(-1, 20, &FreeSansBold18pt7b, "Settings");
+
+        display.setFont(&FreeSansBold9pt7b);
+        display.setCursor(10, 60);
+        display.print("Buzzer: ");
+        display.print(buzzerEnabled ? "[ON]" : "[OFF]");
+
+        display.setCursor(10, 90);
+        display.print("Vibro: ");
+        display.print(vibroEnabled ? "[ON]" : "[OFF]");
+
+        drawItem(-1, 150, &FreeSansBold9pt7b, "OK-toggle  UP-exit");
+    } while (display.nextPage());
+}
+
+void startFlight() {
+    digitalWrite(PIN_VARIO_EN, 1); delay(50); initSensors();
+    display.setPartialWindow(0,0,200,200); display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        drawItem(20, 90, &FreeSansBold18pt7b, "Calibrating...");
+    } while(display.nextPage());
+
+    if(data.sensInit) {
+        if (bmp.performReading()) {
+            varioEMA.init(bmp.readAltitude(SEALEVELPRESSURE_HPA));
+        }
+        float sumMag = 0.0f;
+        const int samples = 100;
+        for(int i=0; i<samples; i++) {
+            float _ax = 0.0f, _ay = 0.0f, _az = 0.0f;
+            Wire.beginTransmission(ADDR_BMA); Wire.write(0x12); Wire.endTransmission();
+            Wire.requestFrom(ADDR_BMA, 6);
+            if(Wire.available()>=6) {
+                int16_t rx = Wire.read()|(Wire.read()<<8);
+                int16_t ry = Wire.read()|(Wire.read()<<8);
+                int16_t rz = Wire.read()|(Wire.read()<<8);
+                _ax = rx/8192.0f;
+                _ay = ry/8192.0f;
+                _az = rz/8192.0f;
+                sumMag += sqrtf(_ax*_ax + _ay*_ay + _az*_az);
+            }
+            if(bmp.performReading()) {
+                float rawAlt = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+                varioEMA.update(_ax, _ay, _az, 0.0f, rawAlt, 0.02f);
+            }
+            delay(10);
+        }
+        data.gMagRef = sumMag / samples;
+        if(data.gMagRef < 0.5f || data.gMagRef > 1.5f) data.gMagRef = 1.0f;
+        float finalAlt = varioEMA.getAltitude();
+        portENTER_CRITICAL(&mux);
+        data.startAlt = finalAlt;
+        data.alt      = finalAlt;
+        data.vel      = 0.0f;
+        data.maxV     = 0.0f;
+        data.minV     = 0.0f;
+        portEXIT_CRITICAL(&mux);
+        data.track = false;
+        stopwatchElapsed = 0;
+        data.tStart = millis();
+        if(!vTaskH) xTaskCreatePinnedToCore(varioTask, "V", 4096, NULL, 10, &vTaskH, 0);
+        state = RUNNING;
+    }
 }
 
 void goDeepSleep() {
@@ -765,6 +835,42 @@ void loop() {
             }
         }
 
+        // Читаем кнопки перед сном
+        bool up = digitalRead(BTN_UP);
+        bool ok = digitalRead(BTN_OK);
+        bool down = digitalRead(BTN_DOWN);
+
+        // DOWN → настройки
+        if (down && !data.lastSt[0]) {
+            delay(50);
+            if(digitalRead(BTN_DOWN)) {
+                state = SETTINGS;
+                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
+                drawSettings();
+                return;
+            }
+        }
+        // OK → старт полёта
+        if (ok && !data.lastSt[1]) {
+            delay(50);
+            if(digitalRead(BTN_OK)) {
+                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
+                startFlight();
+                return;
+            }
+        }
+        // UP → сейчаc в сон (24ч)
+        if (up && !data.lastSt[2]) {
+            delay(50);
+            if(digitalRead(BTN_UP)) {
+                setRTCAlarmSec(CLOCK_SLEEP_STILL);
+                initBMAMotionWake();
+                goDeepSleep();
+            }
+        }
+
+        data.lastSt[0]=down; data.lastSt[1]=ok; data.lastSt[2]=up;
+
         // Если нет движения 15+ мин — спим сутки
         bool stillEnough = (motionTime >= 15) || (!hadMotion && lastWakeMinute >= 0);
         int sleepSec = stillEnough ? CLOCK_SLEEP_STILL : CLOCK_SLEEP_MOTION;
@@ -776,6 +882,55 @@ void loop() {
     // === SLEEP: только по кнопке ===
     if (state == SLEEP) {
         goDeepSleep();
+    }
+
+    // === SETTINGS: экран настроек ===
+    if (state == SETTINGS) {
+        bool up = digitalRead(BTN_UP);
+        bool ok = digitalRead(BTN_OK);
+        bool down = digitalRead(BTN_DOWN);
+
+        // OK — toggle текущей настройки
+        if (ok && !data.lastSt[1]) {
+            delay(50);
+            if(digitalRead(BTN_OK)) {
+                // Просто циклический toggle: buzzer → vibro → buzzer → ...
+                if (!buzzerEnabled || !vibroEnabled) {
+                    if (!buzzerEnabled) buzzerEnabled = true;
+                    else if (!vibroEnabled) vibroEnabled = true;
+                } else {
+                    buzzerEnabled = false;
+                }
+                drawSettings();
+                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
+                return;
+            }
+        }
+        // DOWN — сбросить всё в ON
+        if (down && !data.lastSt[0]) {
+            delay(50);
+            if(digitalRead(BTN_DOWN)) {
+                buzzerEnabled = true;
+                vibroEnabled = true;
+                drawSettings();
+                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
+                return;
+            }
+        }
+        // UP — выход в CLOCK
+        if (up && !data.lastSt[2]) {
+            delay(50);
+            if(digitalRead(BTN_UP)) {
+                readRTC(); drawClock(true);
+                state = CLOCK;
+                data.lastSt[0]=0; data.lastSt[1]=0; data.lastSt[2]=0;
+                return;
+            }
+        }
+
+        data.lastSt[0]=down; data.lastSt[1]=ok; data.lastSt[2]=up;
+        delay(50);
+        return;
     }
 
     // === RUNNING/STOPPED: варио режим ===
@@ -802,78 +957,11 @@ void loop() {
         }
     }
 
-    // Старт полета (Select) — из CLOCK, STOPPED или SLEEP
-    if (bSel && !data.lastSt[0] && (state == CLOCK || state == STOPPED || state == SLEEP)) {
+    // Старт полета — из STOPPED или SLEEP (CLOCK обрабатывается выше)
+    if ((bSel || bR) && (state == STOPPED || state == SLEEP)) {
         delay(50);
-        if(digitalRead(BTN_DOWN)) {
-            digitalWrite(PIN_VARIO_EN, 1); delay(50); initSensors();
-            display.setPartialWindow(0,0,200,200); display.firstPage();
-            do {
-                display.fillScreen(GxEPD_WHITE);
-                drawItem(20, 90, &FreeSansBold18pt7b, "Calibrating...");
-            } while(display.nextPage());
-
-            if(data.sensInit) {
-                // --- КАЛИБРОВКА И ПРОГРЕВ ФИЛЬТРА ---
-                
-                // 1. Инициализируем фильтр начальным значением перед циклом
-                if (bmp.performReading()) {
-                    varioEMA.init(bmp.readAltitude(SEALEVELPRESSURE_HPA));
-                }
-
-                float sumMag = 0.0f;
-                const int samples = 100;
-
-                for(int i=0; i<samples; i++) {
-                    float _ax = 0.0f, _ay = 0.0f, _az = 0.0f;
-
-                    // Чтение Акселерометра (для калибровки G)
-                    Wire.beginTransmission(ADDR_BMA); Wire.write(0x12); Wire.endTransmission();
-                    Wire.requestFrom(ADDR_BMA, 6);
-                    if(Wire.available()>=6) {
-                        int16_t rx = Wire.read()|(Wire.read()<<8);
-                        int16_t ry = Wire.read()|(Wire.read()<<8);
-                        int16_t rz = Wire.read()|(Wire.read()<<8);
-                        _ax = rx/8192.0f;
-                        _ay = ry/8192.0f;
-                        _az = rz/8192.0f;
-                        sumMag += sqrtf(_ax*_ax + _ay*_ay + _az*_az);
-                    }
-
-                    // Чтение Барометра и "прогрев" фильтра
-                    if(bmp.performReading()) {
-                        float rawAlt = bmp.readAltitude(SEALEVELPRESSURE_HPA);
-                        // Передаём сырые ax,ay,az для инициализации gravity vector
-                        // Магнитуда = 0 (стоим на месте, турбулентности нет)
-                        varioEMA.update(_ax, _ay, _az, 0.0f, rawAlt, 0.02f);
-                    }
-                    delay(10);
-                }
-
-                // Завершаем калибровку акселерометра
-                data.gMagRef = sumMag / samples;
-                if(data.gMagRef < 0.5f || data.gMagRef > 1.5f) data.gMagRef = 1.0f;
-
-                // 2. Берем высоту ИЗ ФИЛЬТРА, а не среднее арифметическое
-                // Это убирает "ступеньку" при старте
-                float finalAlt = varioEMA.getAltitude();
-
-                portENTER_CRITICAL(&mux);
-                data.startAlt = finalAlt; 
-                data.alt      = finalAlt;
-                data.vel      = 0.0f;
-                data.maxV     = 0.0f;
-                data.minV     = 0.0f;
-                portEXIT_CRITICAL(&mux);
-
-                data.track = false;
-                stopwatchElapsed = 0;
-                data.tStart = millis();
-                
-                // Запуск задачи обработки (если еще не запущена)
-                if(!vTaskH) xTaskCreatePinnedToCore(varioTask, "V", 4096, NULL, 10, &vTaskH, 0);
-                state = RUNNING;
-            }
+        if(digitalRead(BTN_DOWN) || digitalRead(BTN_OK)) {
+            startFlight();
         }
     }
 
