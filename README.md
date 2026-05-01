@@ -1,127 +1,63 @@
-# VibroVario  
-*The variometer that vibrates — no sound, no distraction. Works on ESP32 E-Ink watches.*
+# VibroVarioAuto v1.2
 
-### Updated to ver 1.1 to filter EMA 2025.11.24
+**Автоматический вариометр для параплана на ESP32 Watchy**
 
-![VibroVario in lift](https://github.com/isemaster/VibroVario/blob/main/media/varioinlift.mp4)
-*(Click to watch: video - reaction for lift)*
+Вибрация + звук (Brauneiger-style) + комплементарный фильтр (IMU+Baro) + энергосбережение.
 
-- ✅ **Silent** — no beeping in your ears, no distraction  
-- ✅ **Tactile coding** — your hand feels better than ears:  
-  - `·` (100 ms) = +0.5 m/s  
-  - `· –` (100 + 300 ms) = +1.0 m/s  
-  - `– – – –` = sinking (caution!)  
-- ✅ **E-Ink display** — visible in direct sunlight, 0 mW in idle  
-- ✅ **One file** — just `VibroVario.ino`, open in Arduino IDE → upload → fly  
-- ✅ **Lightweight** — 24 g (with battery)  
-- ✅ **Long runtime** — 10+ hours on flight on 200 mAh LiPo  
+![Watchy](media/watchy.jpeg)
 
----
+## Возможности
 
-### 🧰 Hardware
+- ✅ **Беззвучный режим** — вибромотор на запястье
+- ✅ **Звук Brauneiger** — частота и ритм пропорциональны Vz (подключаемый буззер)
+- ✅ **Комплементарный фильтр** — акселерометр + барометр. Мгновенный отклик, никакого дрейфа. Работает при любой ориентации часов
+- ✅ **E-Ink дисплей** — читаем на солнце, 0 мВт в покое
+- ✅ **Умное энергосбережение** — RTC alarm, BMA motion wake, автопосадка
+- ✅ **Автостарт** — сам замечает взлёт и предлагает включить варио
+- ✅ **Вес** 24 г (с батареей), **полёт** 10+ часов
 
-| Part | Where to buy | Price |
-|------|--------------|-------|
-| ESP32 Open Source Watchy V2.0 | [AliExpress](https://aliexpress.ru/item/1005007898168161.html) | $30 |
-| BMP390 Sensor | [AliExpress](https://aliexpress.ru/item/1005007988507429.html) | $3 |
+## Аппарат
 
-> 🔋 Note: Uses stock watch battery (200 mAh) — no extra weight.
+| Компонент | Описание |
+|-----------|----------|
+| Watchy v2 | ESP32-PICO-D4, E-Ink 1.54" 200×200 |
+| BMP390 | Барометр (I²C 0x77) |
+| BMA423 | Акселерометр (штатный) |
+| Буззер | GPIO 32 (опционально) |
+| Питание | LiPo 200 мАч |
 
----
+## Схема подключения буззера
 
-### 🔌 Wiring
+```
+Buzzer+ → GPIO 32 (через транзистор если >50 мА)
+Buzzer− → GND
+```
 
-1. Open the watch (4 screws on the back)
-2. Ugrade BMP390 delete LDO add yellow wire
-   
-   ![Wiring guide](https://github.com/isemaster/VibroVario/raw/main/media/UpgradeBMP390.jpeg))  
-4. Solder BMP390:  
-   - `VCC` → `3.3V` on button 
-   - `GND` → `GND`  
-   - `SCL` → `GPIO 22`  
-   - `SDA` → `GPIO 21`  
+Watchy V2: GPIO 32 свободен.
+Watchy V1/V1.5: замени на 16 или 17.
 
-![Wiring guide](https://github.com/isemaster/VibroVario/raw/main/docs/watchy_schematic.jpg)  
+## Мануал
 
-> **Important**: In this project, the BMP390 sensor is powered directly from an ESP32 GPIO pin, and the button connected to that pin shorts it to ground when pressed. Therefore, **it is strongly recommended not to use this button during operation**. A more suitable connection point on the watch PCB will be identified and implemented in a future revision.  
->   
-> This unconventional power arrangement is necessitated by the BMP390 board’s excessive quiescent current (~15 mA). When connected directly to the 3.3 V rail, the board drains a 200 mAh battery in approximately 15 hours.
+Подробная инструкция пилота: [docs/UserManual_ru.md](docs/UserManual_ru.md)
 
----
+## Компиляция
 
-### ⚙️ Setup
+```bash
+# Установить ESP32 core
+arduino-cli core install esp32:esp32
 
-1. Install **Arduino IDE**  
-2. Add ESP32 support:  
-   - `File → Preferences → Additional Boards Manager URLs`:  
-     ```
-     https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-     ```
-3. Install boards:  
-   - `Tools → Board → Boards Manager → search "esp32" → install "ESP32 by Espressif"`  
-4. Install libraries (**Sketch → Include Library → Manage Libraries**):  
-   - `BMP390` by Bosch  
-   - `GxEPD2` by Jean-Marc Zingg  
-   - `BMA423` by Bosch *(optional, for motion compensation)*  
-5. Open `VibroVario.ino`  
-6. Select:  
-   - Board: **ESP32 Dev Module**  
-   - Port: your COM port  
-7. Click **Upload** → done! ✅  
+# Установить библиотеки
+arduino-cli lib install "GxEPD2"
+arduino-cli lib install "Adafruit BMP3XX"
 
-> 📌 First run: keep still for 20 seconds — auto-calibration.
+# Скомпилировать
+arduino-cli compile --fqbn esp32:esp32:esp32 .
+```
 
----
+## Загрузка
 
-### 📊 Tech Specs
+Через Arduino IDE или esptool.py. Выберите плату **ESP32 Dev Module**.
 
-| Metric | Value |
-|--------|-------|
-| Weight | 24 g (with battery) |
-| Dimensions | 46 × 38 × 14 mm |
-| Vz resolution | ±15 cm/s (BMP390 + 2nd-order filter) |
-| Latency | 280 ms |
-| Avg current | 7.1 mA (5 vib/min) |
-| Runtime | 14 days in sleep (theoretical), 10+ h (real flight) |
+## Лицензия
 
-- `Vz` — vertical speed (updates 1×/sec)  
-- Battery % and temperature from BMP390  
-
----
-
-### 🖼️ Gallery
-
-| ![Mod](https://github.com/isemaster/VibroVario/raw/main/media/watchy.jpeg) | ![Screen](https://github.com/isemaster/VibroVario/raw/main/media/onhand.jpeg) |
-|:---:|:---:|
-| BMP390 soldered inside | E-Ink display in sunlight |
-
----
-
-### 📜 License
-
-MIT — use, modify, sell. Just keep the attribution.
-
----
-
-### ❓ FAQ
-
-**Q: What if I have older watch (ESP32-PICO-D4)?**  
-A: Works! Just slower E-Ink refresh (~1.5 sec vs 0.8 sec).  
-
-**Q: Can I disable E-Ink to save power?**  
-A: Yes! Uncomment `#define DISABLE_DISPLAY` at the top of `.ino`.  
-
-**Q: Where’s the calibration code?**  
-A: Built-in: first 20 sec = auto-offset calibration. For advanced: see `extras/calibration.ino`.  
-
-**Q: Does it compensate for G-forces?**  
-A: Yes — if your watch has BMA423 (most do), it subtracts vertical acceleration.
-
----
-
-### 🙏 Thanks to
-
-- Arduino IDE  
-- watchy.sqfmi.com + BMP390 (Bosch?)  
-- ESP32-PICO-D4  
-- gemini-3-pro
+MIT — используйте, модифицируйте, продавайте.
