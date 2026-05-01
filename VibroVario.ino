@@ -157,6 +157,10 @@ TaskHandle_t vTaskH = NULL;
 // Проекция текущего ускорения на него даёт альтитудное ускорение независимо
 // от ориентации часов. Комплементарный фильтр: IMU(быстрый) + Baro(точный).
 // Турбулентность — по магнитуде (все оси).
+// Complementary filter: gravity-vector estimation from accelerometer LPF,
+// projected acceleration gives vertical acceleration regardless of watch orientation.
+// Turbulence magnitude computed from all 3 axes (orientation-independent).
+// Fusion: IMU (fast, drifts) high-pass + Baro (slow, accurate) low-pass.
 class VarioEMA {
   float altFilt_        = 0.0f;
   float altPrev_        = 0.0f;
@@ -305,6 +309,9 @@ void readRTC() {
 }
 
 // Установка RTC alarm на +N секунд от текущего времени
+// BCD (Binary-Coded Decimal) registers: each nibble = one decimal digit.
+// Alarm registers 0x0A-0x0E: 0x80 means "don't care" for that field.
+// Setting minute alarm with 0x80 bit = match only minutes, ignore seconds.
 void setRTCAlarmSec(int secFromNow) {
   Wire.beginTransmission(ADDR_RTC); Wire.write(0x02); Wire.endTransmission();
   Wire.requestFrom(ADDR_RTC, 6);
@@ -352,6 +359,9 @@ void setRTCAlarmSec(int secFromNow) {
 }
 
 // Инициализация BMA423 any-motion interrupt для пробуждения из сна
+// BMA423 register 0x7C = feature config (0x00 = off, 0x04 = any-motion).
+// Reg 0x40 = INT1 config (0x38 = push-pull active low).
+// Reg 0x41 = INT1 mapping (0x01 = any-motion on INT1).
 void initBMAMotionWake() {
   // Устанавливаем any-motion детекцию
   i2cWrite(ADDR_BMA, 0x7C, 0x00); // feature config off
@@ -443,6 +453,11 @@ void varioTask(void *p) {
 
                 vfsm.vSmooth += (data.vel - vfsm.vSmooth) * 0.2f;
 
+                // Brauneiger-style pulse generation:
+                // reqP == -1: continuous vibration (hard sink)
+                // reqP == 0: silence
+                // reqP > 0: burst of N pulses, each V_PULSE ms on, V_GAP ms gap,
+                //           V_PAUSE ms between bursts. Follows 1:1 on/off ratio.
                 // --- ЛОГИКА ГЕНЕРАЦИИ ИМПУЛЬСОВ ---
                 int reqP = 0;
                 float v_check = vfsm.vSmooth;
@@ -487,6 +502,10 @@ void varioTask(void *p) {
                     vfsm.vibroActive = false;
                 }
 
+                // Brauneiger IQ tone: pitch proportional to climb rate,
+                // beat cadence accelerates with climb. 1:1 pulse/pause ratio.
+                // Sink alarm: continuous tone below BZ_SINK_ALARM (-3 m/s).
+                // Silent zone: ±0.3 m/s deadband.
                 // --- БУЗЗЕР ---
                 unsigned long bzNow = millis();
                 float bzV = vfsm.vSmooth;
@@ -570,6 +589,8 @@ void drawMain() {
         sprintf(buf, "%.1fc", dTemp); drawItem(80, 20, &FreeSansBold9pt7b, buf);
 
         // Заряд батареи
+        // LiPo linear approximation: 3.3V=0%, 4.2V=100%. Inaccurate mid-range but sufficient.
+        // analogReadMilliVolts returns mV, /1000 = V, *2 = voltage divider correction (/2 on PCB).
         float v = analogReadMilliVolts(PIN_BATT)/1000.0*2.0;
         sprintf(buf, "%d%%", v>=4.2?100 : (v<=3.3?0 : (int)((v-3.3)*111.1)));
         drawItem(140, 20, &FreeSansBold9pt7b, buf);
@@ -695,6 +716,9 @@ void goDeepSleep() {
 
     // Пробуждение: кнопка BACK (GPIO25), RTC alarm (GPIO27), BMA motion (GPIO14)
     // Все активны при LOW (кнопка → GND, RTC INT → open-drain, BMA INT → active low)
+    // EXT1 wake sources: BTN_UP, RTC alarm, BMA motion.
+    // All active LOW. ESP_EXT1_WAKEUP_ALL_LOW = all selected pins must be LOW.
+    // BTN_OK and BTN_DOWN cannot wake the device from deep sleep.
     const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(RTC_INT_PIN) | BIT64(ACC_INT_1_PIN);
     esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ALL_LOW);
     esp_deep_sleep_start();
@@ -728,6 +752,12 @@ void setup() {
     fsm.state = fsmStateRTC;
 
     // Определяем причину пробуждения
+    // Wake reason determines behavior:
+    // - ESP_SLEEP_WAKEUP_UNDEFINED = first boot → show clock
+    // - BTN_UP wake → user wants to see clock
+    // - RTC_INT_PIN → timed check: 1 BMP read for flight detection
+    // - ACC_INT_1_PIN → motion wake → show clock
+    // FSM_RUNNING on wake = anomaly (deep sleep shouldn't happen mid-flight)
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     uint64_t wakePin = 0;
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
@@ -817,6 +847,9 @@ void loop() {
     bool anyBtn = btn[0] || btn[1] || btn[2];
     unsigned long now = millis();
 
+    // Rising-edge detection with 50ms debounce delay.
+    // fsm.lastBtn stores previous state for edge comparison.
+    // Index mapping: [0]=DOWN, [1]=OK, [2]=UP.
     // Debounce: detection on rising edge
     bool press[3] = { false, false, false };
     for (int i = 0; i < 3; i++) {
@@ -833,6 +866,9 @@ void loop() {
     switch (fsm.state) {
 
     case FSM_CLOCK: {
+        // CLOCK state: device is awake briefly between deep sleep cycles.
+        // Buttons checked first (DOWN→settings, OK→flight, UP→sleep).
+        // If no button: motion tracking + RTC alarm timing → goDeepSleep().
         // DOWN → settings
         if (press[0]) {
             fsm.state = FSM_SETTINGS;
@@ -912,6 +948,9 @@ void loop() {
         break;
 
     case FSM_RUNNING: {
+        // RUNNING: varioTask is active on core 0, loop handles UI and auto-landing.
+        // UP = emergency stop, OK = pause+stats, DOWN = ignored.
+        // Track flag enables max/min recording after 5s stabilization.
         // Ensure vario task exists
         if (!vTaskH) {
             fsm.state = FSM_CLOCK;
@@ -970,6 +1009,7 @@ void loop() {
     }
 
     case FSM_STOPPED:
+        // STOPPED: flight timer frozen, stats displayed. UP=exit, OK=reset RTC, DOWN=restart.
         if (press[2]) { // UP → clock
             if(vTaskH) { vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
