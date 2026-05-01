@@ -199,6 +199,7 @@ DEEP SLEEP  ──►  CLOCK  ──►  RUNNING  ──►  STOPPED
 |----------|-----------|
 | RUNNING | Останавливает полёт → показывает часы (CLOCK) |
 | STOPPED | Показывает часы (CLOCK) |
+| SETTINGS | Выход в часы (CLOCK) |
 | DEEP SLEEP | Будит часы → CLOCK |
 | CLOCK | Уходит в DEEP SLEEP |
 
@@ -209,16 +210,18 @@ DEEP SLEEP  ──►  CLOCK  ──►  RUNNING  ──►  STOPPED
 | CLOCK | **Старт полёта**: калибровка (2 сек), затем полёт |
 | RUNNING | **Стоп полёта**: секундомер замирает, статистика на экране |
 | STOPPED | Сброс часов на 00:00 |
+| SETTINGS | **Toggle**: переключает Buzzer ON/OFF → Vibro ON/OFF → ... |
 | DEEP SLEEP | Ничего |
 
 ### Кнопка DOWN (GPIO 35, нижняя правая)
 
 | В режиме | Что делает |
 |----------|-----------|
-| CLOCK | **Старт полёта**: калибровка (2 сек), затем полёт |
+| CLOCK | **Настройки**: открывает экран Settings |
 | STOPPED | **Новый полёт**: повторная калибровка |
 | RUNNING | Ничего |
 | DEEP SLEEP | Ничего |
+| SETTINGS | **Сброс**: включает Buzzer и Vibro обратно |
 
 ### Кнопка SETUP (GPIO 26, верхняя левая)
 
