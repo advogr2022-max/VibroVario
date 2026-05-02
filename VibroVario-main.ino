@@ -1207,12 +1207,10 @@ void goDeepSleep() {
     ledcDetachPin(BUZZER_PIN);
     display.hibernate(); Wire.end(); WiFi.mode(WIFI_OFF);
 
-    // Wake sources: BTN_UP, BTN_OK, BTN_DOWN, RTC alarm, BMA motion
-    // All active LOW (button → GND, RTC INT → open-drain, BMA INT → active low)
-    // EXT1 wake sources: all buttons, RTC alarm, BMA motion.
-    // All active LOW. ESP_EXT1_WAKEUP_ALL_LOW = all selected pins must be LOW.
-    const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN) | BIT64(RTC_INT_PIN) | BIT64(ACC_INT_1_PIN);
-    esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ALL_LOW);
+    // Wake sources: all 3 buttons (active HIGH, default 0, pressed 1)
+    // RTC alarm and BMA motion: handled via polling on wake from button
+    const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN);
+    esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
     esp_task_wdt_deinit();
     esp_deep_sleep_start();
 }
@@ -1257,10 +1255,9 @@ void setup() {
         wakePin = esp_sleep_get_ext1_wakeup_status();
     }
 
-    // Init display only for visual wake events, not silent RTC alarm checks
+    // Init display only for button wake events (active HIGH)
     bool needDisplay = (cause == ESP_SLEEP_WAKEUP_UNDEFINED) ||
-                       (cause == ESP_SLEEP_WAKEUP_EXT1 &&
-                        (wakePin & (BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN) | BIT64(ACC_INT_1_PIN)))) ||
+                       (cause == ESP_SLEEP_WAKEUP_EXT1) ||
                        (cause != ESP_SLEEP_WAKEUP_UNDEFINED &&
                         (fsmStateRTC == FSM_RUNNING || fsmStateRTC == FSM_STOPPED));
 
@@ -1284,60 +1281,11 @@ void setup() {
             // Go to loop()
         }
         else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-            if (wakePin & (BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN))) {
-                // Wake by any button — show clock
-                drawClock(true);
-                runSelfTest();
-                fsmStateRTC = FSM_CLOCK;
-                fsm.state = FSM_CLOCK;
-            }
-            else if (wakePin & BIT64(RTC_INT_PIN)) {
-                // Wake by RTC alarm (every minute)
-                readRTC();
-                if (rtc_m != lastWakeMinute || lastWakeMinute < 0) {
-                    lastWakeMinute = rtc_m;
-                    if (!needDisplay) {
-                        display.init(115200, true, 2, false);
-                        display.setRotation(1);
-                    }
-                    drawClock(false);  // partial refresh from wake
-                }
-                // Quick flight check: 1 BMP reading
-                digitalWrite(PIN_VARIO_EN, 1);
-                delay(10);
-                if (bmp.begin_I2C(0x77) || bmp.begin_I2C(0x76)) {
-                    bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_4X);
-                    bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
-                    bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-                    bmp.setOutputDataRate(BMP3_ODR_50_HZ);
-                    if (bmp.performReading()) {
-                        float altNow = readAlt();
-                        float vz = (altNow - altCheck) / 60.0f;
-                        altCheck = altNow;
-                        if (vz > FLIGHT_DETECT_VZ) {
-                            display.setPartialWindow(0,0,200,200);
-                            display.firstPage();
-                            do {
-                                display.fillScreen(GxEPD_WHITE);
-                                display.setTextColor(GxEPD_BLACK);
-                                drawItem(-1, 90, &FreeSansBold18pt7b, "FLIGHT!");
-                                drawItem(-1, 130, &FreeSansBold9pt7b, "Press DOWN");
-                            } while(display.nextPage());
-                        }
-                    }
-                    digitalWrite(PIN_VARIO_EN, 0);
-                } else {
-                    digitalWrite(PIN_VARIO_EN, 0);
-                }
-                fsmStateRTC = FSM_CLOCK;
-                fsm.state = FSM_CLOCK;
-            }
-            else if (wakePin & BIT64(ACC_INT_1_PIN)) {
-                // Wake by motion (BMA any-motion)
-                drawClock(true);
-                fsmStateRTC = FSM_CLOCK;
-                fsm.state = FSM_CLOCK;
-            }
+            // Wake by any button — show clock
+            drawClock(true);
+            runSelfTest();
+            fsmStateRTC = FSM_CLOCK;
+            fsm.state = FSM_CLOCK;
         }
     } else if (fsmStateRTC == FSM_STOPPED) {
         drawMain();
@@ -1394,39 +1342,20 @@ void loop() {
             startFlight();
             return;
         }
-        // UP → deep sleep (24h)
+        // UP → deep sleep (until next button press)
         if (press[2]) {
             setRTCAlarmSec(CLOCK_SLEEP_STILL);
-            initBMAMotionWake();
             goDeepSleep();
         }
-        // No button → motion logic + deep sleep
+        // No button → sleep (wake on next button press via ANY_HIGH)
         if (!anyBtn) {
-            // Stay awake 15s after wake so user can press a button for settings
+            // Stay awake 15s after wake so user can press a button
             if (millis() < 15000) { return; }
-
-            bool hadMotion = false;
-            uint64_t pin = 0;
-            esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-            if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-                pin = esp_sleep_get_ext1_wakeup_status();
-                hadMotion = (pin & BIT64(ACC_INT_1_PIN));
-            }
-            if (lastWakeMinute < 0) motionTime = 0;
-            if (hadMotion) motionTime++;
-            else motionTime = 0;
-            if (cause == ESP_SLEEP_WAKEUP_EXT1 && (pin & (BIT64(BTN_OK) | BIT64(BTN_UP)))) {
-                altCheck = 0.0f;
-            }
-            bool stillEnough = (motionTime >= 15) || (!hadMotion && lastWakeMinute >= 0);
-            int sleepSec = stillEnough ? CLOCK_SLEEP_STILL : CLOCK_SLEEP_MOTION;
-            setRTCAlarmSec(sleepSec);
-            initBMAMotionWake();
+            setRTCAlarmSec(CLOCK_SLEEP_STILL);
             goDeepSleep();
         } else {
             // Button was pressed but not handled (shouldn't happen) — sleep anyway
             setRTCAlarmSec(CLOCK_SLEEP_MOTION);
-            initBMAMotionWake();
             goDeepSleep();
         }
         break;
