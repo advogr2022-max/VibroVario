@@ -51,7 +51,7 @@ RTC_DATA_ATTR int varioSensitivity = 4;             // 0=fastest..9=smoothest, d
 // The partition is never formatted as SPIFFS — we use esp_partition
 // directly for raw sequential writes with ring-buffer wrap.
 RTC_DATA_ATTR struct {
-    uint32_t magic;             // 0x54524B54 ("TRK3") — validity marker
+    uint32_t magic;             // 0x54524B55 ("TRK4") — validity marker
     uint16_t flightNum;         // current flight number, auto-increments
     uint32_t writeOffset;       // next write byte offset in partition
     uint16_t lastEraseSector;   // last 4KB sector erased (prevents double-erase)
@@ -60,13 +60,14 @@ RTC_DATA_ATTR struct {
     uint8_t flightStartMon;     // MM of current flight (for CSV export)
 } trackState = {0, 0, 0, 0, 0, 0, 0};
 
-// Packed binary record format (10 bytes):
-// flightNum(2) | date(2: day<<8|mon) | secSinceMidnight(4) | altM(2)
+// Packed binary record format (12 bytes):
+// flightNum(2) | date(2) | secSinceMidnight(4) | altM(2) | crc16(2)
 struct __attribute__((packed)) TrackRecord {
     uint16_t flightNum;
-    uint16_t date;              // (day << 8) | mon  — stored per record for correct CSV dates
+    uint16_t date;              // (day << 8) | mon
     uint32_t secSinceMidnight;
     int16_t altM;
+    uint16_t crc;               // CRC16 of bytes 0-9 (verifies data integrity)
 };
 
 // Flight metadata for web export table
@@ -142,11 +143,11 @@ float sensToTau(int sens) {
 }
 
 // --- HELPER FUNCTIONS ---
-void i2cWrite(uint8_t addr, uint8_t reg, uint8_t val) {
+bool i2cWrite(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
   Wire.write(val);
-  Wire.endTransmission();  // return intentionally ignored — non-critical (BMA motion wake, RTC alarm)
+  return Wire.endTransmission() == 0;
 }
 
 uint8_t bcd2dec(uint8_t v) { return ((v/16*10) + (v%16)); }
@@ -221,13 +222,12 @@ void setRTCAlarmSec(int secFromNow) {
 // Reg 0x41 = INT1 mapping (0x01 = any-motion on INT1).
 void initBMAMotionWake() {
   // Enable any-motion detection: config off → set INT1 → enable
-  i2cWrite(ADDR_BMA, 0x7C, 0x00); // feature config off
+  // If any I2C write fails, motion wake won't work — self-test catches it on next button wake
+  if (!i2cWrite(ADDR_BMA, 0x7C, 0x00)) return;  // feature config off
   delay(5);
-  // Set INT1: active low, push-pull
   i2cWrite(ADDR_BMA, 0x40, 0x38); // INT1 config
   i2cWrite(ADDR_BMA, 0x41, 0x01); // INT1 map: any-motion → INT1
-  // Enable any-motion feature
-  i2cWrite(ADDR_BMA, 0x7C, 0x04);
+  i2cWrite(ADDR_BMA, 0x7C, 0x04); // enable any-motion
   delay(10);
 }
 
@@ -758,6 +758,19 @@ void runSelfTest() {
 }
 
 // --- FLIGHT TRACKER ---
+// CRC16-CCITT (polynomial 0x8005, reflected 0xA001)
+uint16_t crc16(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
+        }
+    }
+    return crc;
+}
+
 // Initialise the ring buffer on the SPIFFS flash partition.
 // On first boot (magic mismatch), erase the entire partition.
 const esp_partition_t* trackPart = NULL;
@@ -767,10 +780,10 @@ void initTracker() {
                                           ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
     if (!trackPart) return;  // no partition — tracking disabled
 
-    if (trackState.magic != 0x54524B54) {
+    if (trackState.magic != 0x54524B55) {
         // First boot — erase entire partition
         esp_partition_erase_range(trackPart, 0, trackPart->size);
-        trackState.magic = 0x54524B54;
+        trackState.magic = 0x54524B55;
         trackState.flightNum = 0;
         trackState.writeOffset = 0;
         trackState.lastEraseSector = 0;
@@ -789,6 +802,8 @@ void logRecord() {
     rec.flightNum = trackState.flightNum;
     rec.altM = (int16_t)roundf(data.alt);
     rec.date = ((uint16_t)trackState.flightStartDay << 8) | trackState.flightStartMon;
+    // Compute CRC16 over first 10 bytes, store in last 2
+    rec.crc = crc16((const uint8_t*)&rec, 10);
     // Compute seconds-since-midnight from flight start
     unsigned long elapsed = millis() / 1000;
     unsigned long secOfDay = (vfsm.flightStartSec + elapsed) % 86400UL;
@@ -850,6 +865,8 @@ int scanFlights(FlightInfo *flights, int maxFlights) {
             TrackRecord rec;
             esp_partition_read(trackPart, off + i * recSz, &rec, recSz);
             if (rec.flightNum == 0) continue;
+            // CRC check: skip corrupted records
+            if (rec.crc != crc16((const uint8_t*)&rec, 10)) continue;
             if (rec.flightNum != curF) {
                 curF = rec.flightNum;
                 if (count < maxFlights) {
@@ -1021,6 +1038,8 @@ void handleExport(WiFiClient &c, int flightFilter) {
             esp_partition_read(trackPart, off + i * recSz, &rec, recSz);
             if (flightFilter > 0 && rec.flightNum != (uint16_t)flightFilter) continue;
             if (rec.flightNum == 0) continue;
+            // CRC check: skip corrupted records
+            if (rec.crc != crc16((const uint8_t*)&rec, 10)) continue;
 
             // Each record carries its own date
             int day = rec.date >> 8;
@@ -1118,7 +1137,8 @@ void handleWebClient() {
     WiFiClient client = webServer.available();
     if (!client) return;
 
-    // Read request line
+    // Read request line with 2s timeout to prevent hanging on broken connections
+    client.setTimeout(2000);
     String request = client.readStringUntil('\n');
     request.trim();
 
@@ -1520,21 +1540,26 @@ void loop() {
             portENTER_CRITICAL(&mux);
             vel = data.vel; ax = data.ax; ay = data.ay;
             portEXIT_CRITICAL(&mux);
-            if (fabsf(vel) < LANDING_DETECT_VZ && fabsf(ax) < 0.1f && fabsf(ay) < 0.1f) {
-                if (vfsm.lastActivity == 0) vfsm.lastActivity = now;
-                if ((now - vfsm.lastActivity) > (LANDING_DETECT_SEC * 1000UL)) {
-                    stopwatchElapsed += (now - data.tStart) / 1000;
-                    if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
-                    digitalWrite(PIN_VARIO_EN, 0);
-                    digitalWrite(PIN_VIBRO, 0);
-                    ledcWrite(BUZZER_PIN, 0);
-                    vfsm.reset();
-                    readRTC(); drawClock(true);
-                    fsm.state = FSM_CLOCK;
-                    return;
+            if (fabsf(vel) < LANDING_DETECT_VZ) {
+                // Use accel for stillness check only when vibro cooldown has passed
+                bool still = !vfsm.vibroActive && (now - vfsm.vibroStopT > VIBRO_COOLDOWN_MS)
+                             && fabsf(ax) < 0.1f && fabsf(ay) < 0.1f;
+                if (still) {
+                    if (vfsm.lastActivity == 0) vfsm.lastActivity = now;
+                    if ((now - vfsm.lastActivity) > (LANDING_DETECT_SEC * 1000UL)) {
+                        stopwatchElapsed += (now - data.tStart) / 1000;
+                        if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
+                        digitalWrite(PIN_VARIO_EN, 0);
+                        digitalWrite(PIN_VIBRO, 0);
+                        ledcWrite(BUZZER_PIN, 0);
+                        vfsm.reset();
+                        readRTC(); drawClock(true);
+                        fsm.state = FSM_CLOCK;
+                        return;
+                    }
+                } else {
+                    vfsm.lastActivity = 0;
                 }
-            } else {
-                vfsm.lastActivity = 0;
             }
         }
         // Enable tracking after 5 sec

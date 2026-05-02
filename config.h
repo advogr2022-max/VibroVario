@@ -8,7 +8,7 @@
 // --- FILTER CONFIG ---
 constexpr float CFG_TAU_BARO_ALT        = 0.1f;   // Altitude smoothing time constant (s)
 constexpr float CFG_TAU_BARO_VARIO_BASE = 0.3f;   // Base vario time constant (calm air)
-constexpr float CFG_TAU_BARO_VARIO_TURB = 0.3f;   // Vario time constant in turbulence
+constexpr float CFG_TAU_BARO_VARIO_TURB = 1.0f;   // Vario time constant in turbulence
 constexpr float CFG_TAU_ACCEL           = 0.1f;   // Accelerometer filter time constant
 constexpr float CFG_ACCEL_TURB_REF      = 2.0f;   // Reference accel (m/s²) for turbulence level
 constexpr float CFG_VARIO_SENS          = 1.0f;   // Vario sensitivity scaling factor
