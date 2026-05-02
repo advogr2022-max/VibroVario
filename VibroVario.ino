@@ -805,12 +805,11 @@ void goDeepSleep() {
     ledcDetach(BUZZER_PIN);
     display.hibernate(); Wire.end(); WiFi.mode(WIFI_OFF);
 
-    // Wake sources: BTN_UP (GPIO25), RTC alarm (GPIO27), BMA motion (GPIO14)
+    // Wake sources: BTN_UP, BTN_OK, BTN_DOWN, RTC alarm, BMA motion
     // All active LOW (button → GND, RTC INT → open-drain, BMA INT → active low)
-    // EXT1 wake sources: BTN_UP, RTC alarm, BMA motion.
+    // EXT1 wake sources: all buttons, RTC alarm, BMA motion.
     // All active LOW. ESP_EXT1_WAKEUP_ALL_LOW = all selected pins must be LOW.
-    // BTN_OK and BTN_DOWN cannot wake the device from deep sleep.
-    const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(RTC_INT_PIN) | BIT64(ACC_INT_1_PIN);
+    const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN) | BIT64(RTC_INT_PIN) | BIT64(ACC_INT_1_PIN);
     esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ALL_LOW);
     esp_deep_sleep_start();
 }
@@ -850,7 +849,7 @@ void setup() {
     // Init display only for visual wake events, not silent RTC alarm checks
     bool needDisplay = (cause == ESP_SLEEP_WAKEUP_UNDEFINED) ||
                        (cause == ESP_SLEEP_WAKEUP_EXT1 &&
-                        (wakePin & (BIT64(BTN_UP) | BIT64(ACC_INT_1_PIN)))) ||
+                        (wakePin & (BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN) | BIT64(ACC_INT_1_PIN)))) ||
                        (cause != ESP_SLEEP_WAKEUP_UNDEFINED &&
                         (fsmStateRTC == FSM_RUNNING || fsmStateRTC == FSM_STOPPED));
 
@@ -874,8 +873,8 @@ void setup() {
             // Go to loop()
         }
         else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-            if (wakePin & BIT64(BTN_UP)) {
-                // Wake by UP button — show clock
+            if (wakePin & (BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN))) {
+                // Wake by any button — show clock
                 drawClock(true);
                 runSelfTest();
                 fsmStateRTC = FSM_CLOCK;
