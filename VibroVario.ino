@@ -37,6 +37,8 @@ constexpr float CFG_TAU_GRAVITY_VEC     = 2.0f;   // Gravity vector LPF time con
 constexpr unsigned long REFRESH_MS = 1000;         // Display refresh period (ms)
 constexpr int LOOP_HZ = 50;                        // Main processing loop frequency (Hz)
 constexpr float SINK_TRH = -5.0f;                  // Hard sink alarm threshold (m/s)
+constexpr float ISA_H = 44330.769f;                // Standard atmosphere scale height
+constexpr float ISA_POW = 5.255876f;               // Standard atmosphere exponent
 
 // --- POWER SAVE ---
 constexpr int CLOCK_SLEEP_MOTION = 60;             // Sleep with motion (s)
@@ -287,7 +289,10 @@ public:
 
 VarioEMA varioEMA;
 
-// --- HELPER FUNCTIONS ---\r
+// Read altitude using user-set QNH. Wraps BMP library call.
+float readAlt() { return bmp.readAltitude(userQNH); }
+
+// --- HELPER FUNCTIONS ---
 void i2cWrite(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
@@ -445,7 +450,7 @@ void varioTask(void *p) {
             if (bmp.performReading()) {
                 vfsm.bmpFailCount = 0;
                 portENTER_CRITICAL(&mux); data.bmpFail = false; portEXIT_CRITICAL(&mux);
-                float baro_alt = bmp.readAltitude(userQNH);
+                float baro_alt = readAlt();
                 float v = varioEMA.update(ax, ay, az, acc_lin_ms2, baro_alt, dt);
 
                 portENTER_CRITICAL(&mux);
@@ -724,15 +729,27 @@ void computeQNHfromAlt(int altMeters) {
         bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
         if (bmp.performReading()) {
             float pAbs = bmp.pressure / 100.0f; // Pa to hPa
-            float ratio = 1.0f - altMeters / 44330.769f;
+            float ratio = 1.0f - altMeters / ISA_H;
             if (ratio > 0.01f) {
-                userQNH = pAbs / powf(ratio, 5.255876f);
+                userQNH = pAbs / powf(ratio, ISA_POW);
                 if (userQNH < 950.0f) userQNH = 950.0f;
                 if (userQNH > 1050.0f) userQNH = 1050.0f;
             }
+            digitalWrite(PIN_VARIO_EN, 0);
+            return; // success
         }
     }
     digitalWrite(PIN_VARIO_EN, 0);
+    // BMP unavailable — show brief warning on e-ink
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setTextColor(GxEPD_BLACK);
+        drawItem(-1, 80, &FreeSansBold18pt7b, "BARO UNAVAIL");
+        drawItem(-1, 130, &FreeSansBold9pt7b, "QNH unchanged");
+    } while (display.nextPage());
+    delay(2000);
 }
 
 void startFlight() {
@@ -745,7 +762,7 @@ void startFlight() {
 
     if(data.sensInit) {
         if (bmp.performReading()) {
-            varioEMA.init(bmp.readAltitude(userQNH));
+            varioEMA.init(readAlt());
         }
         float sumMag = 0.0f;
         const int samples = 100;
@@ -763,7 +780,7 @@ void startFlight() {
                 sumMag += sqrtf(_ax*_ax + _ay*_ay + _az*_az);
             }
             if(bmp.performReading()) {
-                float rawAlt = bmp.readAltitude(userQNH);
+                float rawAlt = readAlt();
                 varioEMA.update(_ax, _ay, _az, 0.0f, rawAlt, 0.02f);
             }
             delay(10);
@@ -962,7 +979,7 @@ void setup() {
                     bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
                     bmp.setOutputDataRate(BMP3_ODR_50_HZ);
                     if (bmp.performReading()) {
-                        float altNow = bmp.readAltitude(userQNH);
+                        float altNow = readAlt();
                         float vz = (altNow - altCheck) / 60.0f;
                         altCheck = altNow;
                         if (vz > FLIGHT_DETECT_VZ) {
@@ -1086,7 +1103,7 @@ void loop() {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 1) % 24;
                     else rtc_m = (rtc_m + 1) % 60;
                 } else if (fsm.settingsRow == 3) {
-                    userAltM += 10;
+                    userAltM += 5;
                     if (userAltM > 5000) userAltM = 5000;
                 }
                 drawSettings(); return;
@@ -1096,7 +1113,7 @@ void loop() {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 23) % 24;
                     else rtc_m = (rtc_m + 59) % 60;
                 } else if (fsm.settingsRow == 3) {
-                    userAltM -= 10;
+                    userAltM -= 5;
                     if (userAltM < 0) userAltM = 0;
                 }
                 drawSettings(); return;
