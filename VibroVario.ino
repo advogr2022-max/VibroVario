@@ -138,6 +138,14 @@ struct __attribute__((packed)) TrackRecord {
     int16_t altM;               // altitude in meters MSL
 };
 
+// Flight metadata for web export table
+struct FlightInfo {
+    uint16_t num;
+    uint16_t recCount;
+    uint32_t startSec;
+    uint32_t endSec;
+};
+
 // Variometer task state machine — replaces all static locals
 struct VarioFsm {
     int pulses = 0;
@@ -993,29 +1001,82 @@ WiFiServer webServer(80);
 unsigned long webExportStartTime = 0;
 bool webExportActive = false;
 
+// Scan ring buffer and extract flight list (up to maxFlights).
+// Returns number of flights found.
+int scanFlights(FlightInfo *flights, int maxFlights) {
+    if (!trackPart || trackState.totalRecords == 0) return 0;
+
+    size_t partSz = trackPart->size;
+    size_t recSz = sizeof(TrackRecord);
+    size_t numSlots = partSz / recSz;
+
+    size_t r1_off, r1_len, r2_off, r2_len;
+    if (trackState.totalRecords <= numSlots) {
+        r1_off = 0; r1_len = trackState.writeOffset;
+        r2_off = 0; r2_len = 0;
+    } else {
+        r1_off = trackState.writeOffset;
+        r1_len = partSz - trackState.writeOffset;
+        r2_off = 0; r2_len = trackState.writeOffset;
+    }
+
+    int count = 0;
+    uint16_t curF = 0;
+    FlightInfo *cur = NULL;
+
+    auto readRange = [&](size_t off, size_t len) {
+        size_t cnt = len / recSz;
+        for (size_t i = 0; i < cnt; i++) {
+            TrackRecord rec;
+            esp_partition_read(trackPart, off + i * recSz, &rec, recSz);
+            if (rec.flightNum == 0) continue;
+            if (rec.flightNum != curF) {
+                curF = rec.flightNum;
+                if (count < maxFlights) {
+                    cur = &flights[count++];
+                    cur->num = rec.flightNum;
+                    cur->startSec = rec.secSinceMidnight;
+                    cur->endSec = rec.secSinceMidnight;
+                    cur->recCount = 1;
+                }
+            } else if (cur) {
+                cur->endSec = rec.secSinceMidnight;
+                cur->recCount++;
+            }
+        }
+    };
+
+    if (r1_len) readRange(r1_off, r1_len);
+    if (r2_len) readRange(r2_off, r2_len);
+    return count;
+}
+
 void drawWebExport() {
+    // Count flights on-screen
+    FlightInfo flist[30];
+    int nFlights = scanFlights(flist, 30);
+
     display.setFullWindow();
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        drawItem(-1, 15, &FreeSansBold18pt7b, "WiFi Export");
-        drawItem(-1, 40, &FreeSansBold9pt7b, "SSID: VibroVario");
-        drawItem(-1, 60, &FreeSansBold9pt7b, "IP: 192.168.4.1");
+        drawItem(-1, 12, &FreeSansBold18pt7b, "WiFi Export");
+        drawItem(-1, 38, &FreeSansBold9pt7b, "SSID: VibroVario");
+        drawItem(-1, 55, &FreeSansBold9pt7b, "IP: 192.168.4.1");
         char buf[32];
         int remain = (15*60 - (int)((millis() - webExportStartTime)/1000));
         if (remain < 0) remain = 0;
-        sprintf(buf, "Active: %02d:%02d", remain/60, remain%60);
-        drawItem(-1, 80, &FreeSansBold9pt7b, buf);
-        drawItem(-1, 105, &FreeSansBold9pt7b, "Open browser to IP");
-        drawItem(-1, 125, &FreeSansBold9pt7b, "/export  - all flights");
-        drawItem(-1, 145, &FreeSansBold9pt7b, "/export?f=1 - flight 1");
+        sprintf(buf, "Timer: %02d:%02d  Flights: %d", remain/60, remain%60, nFlights);
+        drawItem(-1, 72, &FreeSansBold9pt7b, buf);
+        drawItem(-1, 100, &FreeSansBold9pt7b, "Open browser to 192.168.4.1");
+        drawItem(-1, 120, &FreeSansBold9pt7b, "/export   - CSV all flights");
+        drawItem(-1, 140, &FreeSansBold9pt7b, "/settings - set time/alt");
         drawItem(-1, 175, &FreeSansBold9pt7b, "UP - exit");
     } while (display.nextPage());
 }
 
 void startWebExport() {
-    // Turn on WiFi in AP mode
     WiFi.mode(WIFI_AP);
     WiFi.softAP("VibroVario");
     webServer.begin();
@@ -1024,7 +1085,6 @@ void startWebExport() {
     drawWebExport();
 }
 
-// Format seconds-since-midnight as HH:MM:SS
 static void fmtTime(char* buf, uint32_t sec) {
     uint8_t h = sec / 3600;
     uint8_t m = (sec % 3600) / 60;
@@ -1032,146 +1092,266 @@ static void fmtTime(char* buf, uint32_t sec) {
     sprintf(buf, "%02d:%02d:%02d", h, m, s);
 }
 
-// Read all records from the ring buffer and send as CSV.
-// Flights are separated by flightNum changes.
-// If flightFilter > 0, only that flight number is exported.
-void exportCSV(WiFiClient &client, int flightFilter) {
+static void fmtDuration(char* buf, uint32_t startSec, uint32_t endSec) {
+    if (endSec < startSec) endSec += 86400;  // midnight cross
+    uint32_t d = endSec - startSec;
+    sprintf(buf, "%02d:%02d:%02d", d/3600, (d%3600)/60, d%60);
+}
+
+// === HTTP HANDLERS ===
+
+void send_http_ok(WiFiClient &c) {
+    c.println("HTTP/1.1 200 OK");
+    c.println("Connection: close");
+}
+
+void send_head(WiFiClient &c) {
+    c.println("<!DOCTYPE html><html><head>");
+    c.println("<meta charset='utf-8'><meta name='viewport' content='width=device-width'>");
+    c.println("<style>body{font:14px/1.4 sans-serif;margin:20px;max-width:600px}");
+    c.println("a{color:#06f}th{text-align:left;padding:2px 8px}td{padding:2px 8px}");
+    c.println("input{font:14px;width:80px;margin:2px}.btn{display:inline-block;padding:6px 14px;background:#06f;color:#fff;text-decoration:none;border-radius:4px}");
+    c.println("</style></head><body>");
+}
+
+void send_foot(WiFiClient &c) {
+    c.println("</body></html>");
+}
+
+void handleRoot(WiFiClient &c) {
+    send_http_ok(c);
+    c.println("Content-Type: text/html; charset=utf-8");
+    c.println();
+    send_head(c);
+    c.println("<h2>VibroVario</h2>");
+    char buf[128];
+    int remain = (15*60 - (int)((millis() - webExportStartTime)/1000));
+    if (remain < 0) remain = 0;
+    sprintf(buf, "<p>Active: <b>%02d:%02d</b></p>", remain/60, remain%60);
+    c.println(buf);
+
+    c.println("<p><a class='btn' href='/export'>Download all flights (CSV)</a></p>");
+
+    // Flight table
+    FlightInfo flist[30];
+    int nFlights = scanFlights(flist, 30);
+    if (nFlights > 0) {
+        c.println("<table><tr><th>Flight</th><th>Date</th><th>Start</th><th>Duration</th><th>Points</th><th></th></tr>");
+        // We need date for each flight. Use flightStartDay/Mon from most recent flight's date,
+        // or RTC date for fallback.
+        int day = trackState.flightStartDay ? trackState.flightStartDay : rtc_d;
+        int mon = trackState.flightStartMon ? trackState.flightStartMon : rtc_mon;
+        for (int i = nFlights - 1; i >= 0; i--) {  // newest first
+            FlightInfo &f = flist[i];
+            char ts[9], dur[9];
+            fmtTime(ts, f.startSec);
+            fmtDuration(dur, f.startSec, f.endSec);
+            sprintf(buf, "<tr><td>%d</td><td>%02d.%02d</td><td>%s</td><td>%s</td><td>%d</td>",
+                    f.num, day, mon, ts, dur, f.recCount);
+            c.println(buf);
+            sprintf(buf, "<td><a href='/export?f=%d'>CSV</a></td></tr>", f.num);
+            c.println(buf);
+        }
+        c.println("</table>");
+    } else {
+        c.println("<p>No flights recorded.</p>");
+    }
+
+    c.println("<hr><p><a href='/settings'>Settings: time & altitude</a></p>");
+    send_foot(c);
+}
+
+void handleExport(WiFiClient &c, int flightFilter) {
     if (!trackPart || trackState.totalRecords == 0) {
-        client.println("No track data");
+        send_http_ok(c);
+        c.println("Content-Type: text/plain; charset=utf-8");
+        c.println();
+        c.println("No track data");
+        c.stop();
         return;
     }
 
-    // Determine read ranges (ring buffer order: oldest first)
+    send_http_ok(c);
+    c.println("Content-Type: text/csv; charset=utf-8");
+    c.println("Content-Disposition: attachment; filename=vibrovario.csv");
+    c.println();
+
+    // Export CSV
     size_t partSz = trackPart->size;
     size_t recSz = sizeof(TrackRecord);
     size_t numSlots = partSz / recSz;
 
-    size_t r1_off = 0, r1_len = 0;
-    size_t r2_off = 0, r2_len = 0;
-
+    size_t r1_off, r1_len, r2_off, r2_len;
     if (trackState.totalRecords <= numSlots) {
-        // No wrap: data is [0, writeOffset)
-        r1_off = 0;
-        r1_len = trackState.writeOffset;
+        r1_off = 0; r1_len = trackState.writeOffset;
+        r2_off = 0; r2_len = 0;
     } else {
-        // Wrapped: oldest at writeOffset to end, then 0 to writeOffset
         r1_off = trackState.writeOffset;
         r1_len = partSz - trackState.writeOffset;
-        r2_off = 0;
-        r2_len = trackState.writeOffset;
+        r2_off = 0; r2_len = trackState.writeOffset;
     }
 
-    // CSV header
-    client.println("FLT;DATE;TIME;ALT_M");
-
+    c.println("FLT;DATE;TIME;ALT_M");
     uint16_t curFlight = 0xFFFF;
     int day = 0, mon = 0;
 
-    // Read helper
-    auto readAndSend = [&](size_t offset, size_t length) -> bool {
-        size_t count = length / recSz;
-        for (size_t i = 0; i < count; i++) {
+    auto sendRange = [&](size_t off, size_t len) {
+        size_t cnt = len / recSz;
+        for (size_t i = 0; i < cnt; i++) {
             TrackRecord rec;
-            esp_partition_read(trackPart, offset + i * recSz, &rec, recSz);
+            esp_partition_read(trackPart, off + i * recSz, &rec, recSz);
+            if (flightFilter > 0 && rec.flightNum != (uint16_t)flightFilter) continue;
+            if (rec.flightNum == 0) continue;
 
-            // Filter by flight
-            if (flightFilter > 0 && rec.flightNum != (uint16_t)flightFilter)
-                continue;
-            if (rec.flightNum == 0) // uninitialized
-                continue;
-
-            // Detect flight boundary
             if (rec.flightNum != curFlight) {
                 curFlight = rec.flightNum;
-                // Use stored date from the flight start
                 day = trackState.flightStartDay;
                 mon = trackState.flightStartMon;
-                // Fallback: if date is 0, use current RTC date
                 if (day == 0 || mon == 0) { day = rtc_d; mon = rtc_mon; }
             }
 
-            char timeStr[9];
-            fmtTime(timeStr, rec.secSinceMidnight);
-
+            char ts[9];
+            fmtTime(ts, rec.secSinceMidnight);
             char buf[64];
-            sprintf(buf, "%d;%02d.%02d;%s;%d", rec.flightNum, day, mon, timeStr, rec.altM);
-            client.println(buf);
-
-            if (!client) return false;  // disconnected
+            sprintf(buf, "%d;%02d.%02d;%s;%d", rec.flightNum, day, mon, ts, rec.altM);
+            c.println(buf);
+            if (!c) return false;
         }
         return true;
     };
 
-    if (r1_len > 0) { if (!readAndSend(r1_off, r1_len)) return; }
-    if (r2_len > 0) { readAndSend(r2_off, r2_len); }
+    if (r1_len) if (!sendRange(r1_off, r1_len)) return;
+    if (r2_len) sendRange(r2_off, r2_len);
+}
+
+void handleSettings(WiFiClient &c) {
+    // Read current RTC time
+    readRTC();
+    send_http_ok(c);
+    c.println("Content-Type: text/html; charset=utf-8");
+    c.println();
+    send_head(c);
+    c.println("<h2>Settings</h2>");
+    c.println("<form action='/set' method='get'>");
+    char buf[128];
+
+    // Time
+    c.println("<h3>Clock</h3>");
+    sprintf(buf, "<p>Hour: <input type='number' name='h' min='0' max='23' value='%d'></p>", rtc_h);
+    c.println(buf);
+    sprintf(buf, "<p>Min:  <input type='number' name='m' min='0' max='59' value='%d'></p>", rtc_m);
+    c.println(buf);
+
+    // Altitude / QNH
+    c.println("<h3>Field Altitude (auto QNH)</h3>");
+    sprintf(buf, "<p>Alt (m): <input type='number' name='alt' min='0' max='5000' value='%d'></p>", userAltM);
+    c.println(buf);
+    sprintf(buf, "<p>Current QNH: %.2f hPa</p>", userQNH);
+    c.println(buf);
+
+    c.println("<p><input type='submit' value='Save'></p>");
+    c.println("</form>");
+    c.println("<p><a href='/'>Back</a></p>");
+    send_foot(c);
+}
+
+void handleSet(WiFiClient &c, String &query) {
+    // Parse GET parameters: ?h=14&m=30 or ?alt=300 or combination
+    int newH = -1, newM = -1, newAlt = -1;
+    int pos;
+
+    pos = query.indexOf("h=");
+    if (pos >= 0) newH = query.substring(pos + 2).toInt();
+    // Check if there's a '&' after h value
+    int amp = query.indexOf('&', pos + 2);
+    if (amp > 0 && newH >= 0) newH = query.substring(pos + 2, amp).toInt();
+
+    pos = query.indexOf("m=");
+    if (pos >= 0) {
+        amp = query.indexOf('&', pos + 2);
+        if (amp > 0) newM = query.substring(pos + 2, amp).toInt();
+        else newM = query.substring(pos + 2).toInt();
+    }
+
+    pos = query.indexOf("alt=");
+    if (pos >= 0) {
+        amp = query.indexOf('&', pos + 4);
+        if (amp > 0) newAlt = query.substring(pos + 4, amp).toInt();
+        else newAlt = query.substring(pos + 4).toInt();
+    }
+
+    // Validate
+    if (newH >= 0 && newH < 24 && newM >= 0 && newM < 60) {
+        writeTimeToRTC(newH, newM);
+        rtc_h = newH; rtc_m = newM;
+    }
+    if (newAlt >= 0 && newAlt <= 5000) {
+        userAltM = newAlt;
+        computeQNHfromAlt(newAlt);
+    }
+
+    // Redirect back to settings page
+    c.println("HTTP/1.1 303 See Other");
+    c.println("Location: /settings");
+    c.println("Connection: close");
+    c.println();
 }
 
 void handleWebClient() {
     WiFiClient client = webServer.available();
     if (!client) return;
 
-    // Read the first line of the HTTP request
+    // Read request line
     String request = client.readStringUntil('\n');
     request.trim();
-    client.readStringUntil('\n');  // consume headers (all remaining)
 
-    // Parse path: GET /export or GET /export?f=N or GET /
+    // Consume the rest of headers
+    while (client.connected()) {
+        String h = client.readStringUntil('\n');
+        h.trim();
+        if (h.length() == 0) break;
+    }
+
+    // Parse path
     int flightFilter = -1;
-    bool isExport = false;
+    bool handled = false;
 
-    if (request.indexOf("GET /export") == 0) {
-        isExport = true;
-        // Check for ?f=N parameter
+    if (request.indexOf("GET / ") == 0 || request.indexOf("GET / HTTP") == 0) {
+        handleRoot(client);
+        handled = true;
+    } else if (request.indexOf("GET /export") == 0) {
         int fPos = request.indexOf("?f=");
         if (fPos > 0) {
-            flightFilter = request.substring(fPos + 3).toInt();
+            String val = request.substring(fPos + 3);
+            int amp = val.indexOf(' ');
+            if (amp > 0) val = val.substring(0, amp);
+            flightFilter = val.toInt();
         }
-    } else if (request.indexOf("GET / ") == 0) {
-        isExport = false;
-    } else {
-        // Unknown path, 404
+        handleExport(client, flightFilter);
+        handled = true;
+    } else if (request.indexOf("GET /settings") == 0) {
+        handleSettings(client);
+        handled = true;
+    } else if (request.indexOf("GET /set") == 0) {
+        int qPos = request.indexOf('?');
+        if (qPos > 0) {
+            String query = request.substring(qPos + 1);
+            int sp = query.indexOf(' ');
+            if (sp > 0) query = query.substring(0, sp);
+            handleSet(client, query);
+        } else {
+            client.println("HTTP/1.1 400 Bad Request");
+            client.println("Connection: close");
+            client.println();
+        }
+        handled = true;
+    }
+
+    if (!handled) {
         client.println("HTTP/1.1 404 Not Found");
         client.println("Connection: close");
         client.println();
-        client.stop();
-        return;
     }
-
-    if (isExport) {
-        // Send CSV
-        client.println("HTTP/1.1 200 OK");
-        client.println("Content-Type: text/csv; charset=utf-8");
-        client.println("Content-Disposition: attachment; filename=vibrovario.csv");
-        client.println("Connection: close");
-        client.println();
-        exportCSV(client, flightFilter);
-    } else {
-        // Landing page
-        client.println("HTTP/1.1 200 OK");
-        client.println("Content-Type: text/html; charset=utf-8");
-        client.println("Connection: close");
-        client.println();
-        client.println("<!DOCTYPE html><html><body>");
-        client.println("<h2>VibroVario Export</h2>");
-        client.println("<p><a href=\"/export\">Download all flights (CSV)</a></p>");
-        char buf[128];
-        int remain = (15*60 - (int)((millis() - webExportStartTime)/1000));
-        if (remain < 0) remain = 0;
-        sprintf(buf, "<p>Active: %02d:%02d</p>", remain/60, remain%60);
-        client.println(buf);
-        // List individual flights from track data
-        if (trackPart && trackState.totalRecords > 0) {
-            client.println("<ul>");
-            int maxF = trackState.flightNum;
-            for (int f = 1; f <= maxF; f++) {
-                sprintf(buf, "<li><a href=\"/export?f=%d\">Flight %d</a></li>", f, f);
-                client.println(buf);
-            }
-            client.println("</ul>");
-        }
-        client.println("</body></html>");
-    }
-
     client.stop();
 }
 
