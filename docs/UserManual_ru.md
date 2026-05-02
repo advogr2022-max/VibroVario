@@ -383,7 +383,53 @@ A: Так и задумано — WiFi жрёт ~80 мА. Автоотключе
 
 ---
 
-## 13. Благодарности
+## 13. Установка и компиляция (для сборки своими руками)
+
+### Структура проекта
+
+```
+VibroVario/                    ← папка скетча
+├── VibroVario.ino             ← главный файл (открывать в Arduino IDE)
+├── config.h                   ← пины, константы, настройки фильтра
+├── VarioEMA.h                 ← класс комплементарного фильтра
+├── README.md                  ← описание проекта (русский)
+└── docs/
+    ├── UserManual_ru.md       ← эта инструкция
+    └── UserManual_en.md       ← English manual
+```
+
+### Что нужно для сборки
+
+1. **Arduino IDE** (скачать с arduino.cc) — версия 2.x или 1.8+
+2. **Плата ESP32** — в меню Файл → Настройки → «Дополнительные ссылки для менеджера плат» вставить:
+   `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
+3. **Установить ESP32** — Инструменты → Плата → Менеджер плат → найти "ESP32" → установить
+4. **Библиотеки** — Менеджер библиотек (Скетч → Подключить библиотеку → Управлять библиотеками):
+   - `GxEPD2` (последняя версия)
+   - `Adafruit BMP3XX`
+   - `Adafruit Unified Sensor`
+5. **Подключить Watchy** через USB
+6. **Выбрать плату** — Инструменты → Плата → ESP32 Arduino → ESP32 Dev Module
+7. **Параметры платы:**
+   - Flash Size: `4MB (32Mb)`
+   - Partition Scheme: `Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)`
+8. **Открыть файл** — Файл → Открыть → выбрать папку `VibroVario` → откроется `VibroVario.ino`
+9. **Нажать Upload** (→)
+
+Файлы `config.h` и `VarioEMA.h` подхватятся автоматически — их не нужно добавлять вручную.
+
+### Компиляция через CLI (для продвинутых)
+
+```bash
+arduino-cli core install esp32:esp32
+arduino-cli lib install "GxEPD2"
+arduino-cli lib install "Adafruit BMP3XX"
+arduino-cli compile --fqbn esp32:esp32:esp32 .
+```
+
+---
+
+## 14. Благодарности
 
 Проект: [github.com/isemaster/VibroVario](https://github.com/isemaster/VibroVario)
 Разработано: isemaster, форк: advogr2022-max

@@ -290,7 +290,53 @@ Battery: 200 mAh LiPo (3.7V). 4.2V = 100%, 3.3V = 0%.
 
 ---
 
-## 11. Troubleshooting
+## 11. Setup & Compilation (for DIY builders)
+
+### Project Structure
+
+```
+VibroVario/                    ← sketch folder
+├── VibroVario.ino             ← main file (open in Arduino IDE)
+├── config.h                   ← pins, constants, filter settings
+├── VarioEMA.h                 ← complementary filter class
+├── README.md                  ← project description
+└── docs/
+    ├── UserManual_ru.md       ← Russian manual
+    └── UserManual_en.md       ← this manual
+```
+
+### Prerequisites
+
+1. **Arduino IDE** (download from arduino.cc) — version 2.x or 1.8+
+2. **ESP32 board support** — File → Preferences → Additional boards manager URLs, add:
+   `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
+3. **Install ESP32** — Tools → Board → Boards Manager → search "ESP32" → Install
+4. **Libraries** — Sketch → Include Library → Manage Libraries:
+   - `GxEPD2` (latest version)
+   - `Adafruit BMP3XX`
+   - `Adafruit Unified Sensor`
+5. **Connect Watchy** via USB
+6. **Select board** — Tools → Board → ESP32 Arduino → ESP32 Dev Module
+7. **Board settings:**
+   - Flash Size: `4MB (32Mb)`
+   - Partition Scheme: `Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)`
+8. **Open sketch** — File → Open → select the `VibroVario` folder → `VibroVario.ino` opens
+9. **Click Upload** (→)
+
+`config.h` and `VarioEMA.h` are auto-detected — no manual file adding needed.
+
+### CLI Compilation (advanced)
+
+```bash
+arduino-cli core install esp32:esp32
+arduino-cli lib install "GxEPD2"
+arduino-cli lib install "Adafruit BMP3XX"
+arduino-cli compile --fqbn esp32:esp32:esp32 .
+```
+
+---
+
+## 12. Troubleshooting
 
 **Q: Screen blank, nothing happens.**
 A: Press any button (UP/OK/DOWN). If no response — connect USB.
@@ -312,7 +358,7 @@ A: Normal — WiFi consumes ~80 mA. Auto-off after 15 minutes.
 
 ---
 
-## 12. Credits
+## 13. Credits
 
 Original project: [github.com/isemaster/VibroVario](https://github.com/isemaster/VibroVario)
 Original by: isemaster
