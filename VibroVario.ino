@@ -10,6 +10,7 @@
  */
 
 #include <esp_sleep.h>
+#include <esp_task_wdt.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
@@ -416,6 +417,7 @@ void drawItem(int x, int y, const GFXfont* f, String txt) {
 // --- VARIOMETER TASK (FreeRTOS) ---
 // All state in vfsm (VarioFsm), no static locals
 void varioTask(void *p) {
+    esp_task_wdt_add(NULL);  // subscribe core 0 task to WDT
     for(;;) {
         if (fsmStateRTC == FSM_RUNNING && data.sensInit && vfsm.running) {
             float ax = 0.0f, ay = 0.0f, az = 0.0f;
@@ -584,6 +586,7 @@ void varioTask(void *p) {
             ledcWrite(BUZZER_PIN, 0);
         }
 
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1000/LOOP_HZ));
     }
 }
@@ -889,6 +892,7 @@ void goDeepSleep() {
     // All active LOW. ESP_EXT1_WAKEUP_ALL_LOW = all selected pins must be LOW.
     const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN) | BIT64(RTC_INT_PIN) | BIT64(ACC_INT_1_PIN);
     esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ALL_LOW);
+    esp_task_wdt_deinit();
     esp_deep_sleep_start();
 }
 
@@ -913,6 +917,15 @@ void setup() {
     WiFi.mode(WIFI_OFF);
 
     readRTC();
+
+    // Init watchdog: 10 second timeout, panic on expiry
+    esp_task_wdt_config_t wdtConfig = {
+        .timeout_ms = 10000,
+        .idle_core_mask = 0,
+        .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdtConfig);
+    esp_task_wdt_add(NULL);  // subscribe loop() task (core 1)
 
     // Restore runtime FSM state from RTC
     fsm.state = fsmStateRTC;
@@ -1020,6 +1033,7 @@ void setup() {
 }
 
 void loop() {
+    esp_task_wdt_reset();
     // === FSM TICK ===
     bool btn[3] = { digitalRead(BTN_DOWN), digitalRead(BTN_OK), digitalRead(BTN_UP) };
     bool anyBtn = btn[0] || btn[1] || btn[2];
