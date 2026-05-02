@@ -1,12 +1,12 @@
-/* Версия 1.5b — English cross-reference comments, FSM transition docs
- * Прошивка ESP32 Вариометра
- * Форк/порт оригинального VibroVario (github.com/isemaster/VibroVario)
- * Основной функционал:
- * - Считывание данных с барометра BMP3XX и акселерометра (BMA).
- * - Fusion-фильтрация (EMA) данных для быстрого отклика вариометра.
- * - Вывод информации на E-Ink дисплей.
- * - Звуковая/Вибро индикация подъема и спуска.
- * - Управление питанием (Deep Sleep).
+/* Version 1.5b — English cross-reference comments, FSM transition docs
+ * ESP32 Variometer firmware
+ * Fork/port of original VibroVario (github.com/isemaster/VibroVario)
+ * Main features:
+ * - Reads BMP3XX barometer and BMA accelerometer data.
+ * - Fusion (EMA) filtering for fast variometer response.
+ * - E-Ink display output.
+ * - Vibration/Sound lift and sink indication.
+ * - Power management (Deep Sleep).
  */
 
 #include <esp_sleep.h>
@@ -21,94 +21,91 @@
 #include "FreeMonoBold36pt7b.h"
 #include <cmath>
 
-// --- НАСТРОЙКИ ФИЛЬТРОВ (Fusion) ---
-float CFG_TAU_BARO_ALT        = 0.1f;   // Постоянная времени сглаживания высоты (сек)
-float CFG_TAU_BARO_VARIO_BASE = 0.3f;   // Базовая постоянная времени вариометра (в спокойном воздухе)
-float CFG_TAU_BARO_VARIO_TURB = 0.3f;   // Постоянная времени при турбулентности (динамическая настройка)
-float CFG_TAU_ACCEL           = 0.1f;   // Постоянная времени фильтра акселерометра
-float CFG_ACCEL_TURB_REF      = 2.0f;   // Эталонное ускорение (м/с²) для определения уровня турбулентности
-float CFG_VARIO_SENS          = 1.0f;   // Масштабный коэффициент чувствительности вариометра
-float CFG_TAU_COMPLEMENTARY   = 3.0f;   // Постоянная времени комплементарного фильтра (сек)
-                                         // > 3c: баро доминирует, < 3c: IMU доминирует
-float CFG_TAU_GRAVITY_VEC     = 2.0f;   // Постоянная времени оценки направления гравитации (сек)
-                                         // Определяет "вертикаль" независимо от ориентации часов
+// --- FILTER CONFIG ---
+constexpr float CFG_TAU_BARO_ALT        = 0.1f;   // Altitude smoothing time constant (s)
+constexpr float CFG_TAU_BARO_VARIO_BASE = 0.3f;   // Base vario time constant (calm air)
+constexpr float CFG_TAU_BARO_VARIO_TURB = 0.3f;   // Vario time constant in turbulence
+constexpr float CFG_TAU_ACCEL           = 0.1f;   // Accelerometer filter time constant
+constexpr float CFG_ACCEL_TURB_REF      = 2.0f;   // Reference accel (m/s²) for turbulence level
+constexpr float CFG_VARIO_SENS          = 1.0f;   // Vario sensitivity scaling factor
+constexpr float CFG_TAU_COMPLEMENTARY   = 3.0f;   // Complementary filter time constant (s)
+                                         // > 3s: baro dominates, < 3s: IMU dominates
+constexpr float CFG_TAU_GRAVITY_VEC     = 2.0f;   // Gravity vector LPF time constant (s)
+                                         // Determines "down" regardless of watch orientation
 
-// --- СИСТЕМНЫЕ НАСТРОЙКИ ---
-#define SEALEVELPRESSURE_HPA 1013.25     // Давление на уровне моря для расчета высоты
-#define REFRESH_MS 1000                 // Период обновления экрана (мс)
-#define LOOP_HZ 50                      // Частота основного цикла обработки (Гц)
-#define SINK_TRH -5.0f                  // Порог срабатывания сигнала снижения (м/с)
+// --- SYSTEM CONFIG ---
+constexpr float SEALEVELPRESSURE_HPA = 1013.25f;  // MSL pressure for altitude calculation
+constexpr unsigned long REFRESH_MS = 1000;         // Display refresh period (ms)
+constexpr int LOOP_HZ = 50;                        // Main processing loop frequency (Hz)
+constexpr float SINK_TRH = -5.0f;                  // Hard sink alarm threshold (m/s)
 
-// --- НАСТРОЙКИ ЭНЕРГОСБЕРЕЖЕНИЯ ---
-#define CLOCK_SLEEP_MOTION 60           // Сон с движением (сек)
-#define CLOCK_SLEEP_STILL  86400        // Сон без движения (24ч)
-#define FLIGHT_DETECT_VZ  0.75f          // Порог Vz для автостарта полёта (м/с)
-#define FLIGHT_DETECT_SEC 3             // Сколько секунд Vz > порога для старта
-#define LANDING_DETECT_VZ  0.75f         // Порог Vz для автоопределения посадки (м/с)
-#define LANDING_DETECT_SEC 300          // 5 мин без движения = посадка
+// --- POWER SAVE ---
+constexpr int CLOCK_SLEEP_MOTION = 60;             // Sleep with motion (s)
+constexpr int CLOCK_SLEEP_STILL = 86400;           // Sleep without motion (24h)
+constexpr float FLIGHT_DETECT_VZ = 0.75f;          // Vz threshold for auto-flight start (m/s)
+constexpr float LANDING_DETECT_VZ = 0.75f;         // Vz threshold for landing detection (m/s)
+constexpr int LANDING_DETECT_SEC = 300;            // 5 min idle before auto-landing
 
-// --- НАСТРОЙКИ АКСЕЛЕРОМЕТРА ---
-#define GRAVITY_G 9.80665f              // Ускорение свободного падения
+// --- ACCELEROMETER CONFIG ---
+constexpr float GRAVITY_G = 9.80665f;              // Standard gravity
 
-// --- ПОРОГИ ЗВУКА И ИМПУЛЬСЫ ---
-// Пороги вертикальной скорости (м/с) и соответствующее количество импульсов вибро
+// --- VIBRO PULSE THRESHOLDS ---
+// Vertical speed thresholds (m/s) and corresponding vibration pulse count per burst
 const float LIFT_TH[]    = {0.15f, 0.4f, 1.0f, 2.0f, 1000.0f}; 
 const int   LIFT_PULSES[] = {1, 2, 3, 4};
 
-// --- НАСТРОЙКИ ВИБРАЦИИ ---
-#define V_PULSE 30                      // Длительность импульса вибрации (мс)
-#define V_GAP   100                     // Пауза между импульсами в пачке (мс)
-#define V_PAUSE 500                     // Длинная пауза между пачками (мс)
-#define VIBRO_COOLDOWN_MS 200           // Время "остывания" после вибрации перед замером акселерометра (защита от шума)
+// --- VIBRATION TIMING ---
+constexpr int V_PULSE = 30;                        // Single vibration pulse duration (ms)
+constexpr int V_GAP    = 100;                      // Gap between pulses in a burst (ms)
+constexpr int V_PAUSE  = 500;                      // Long pause between bursts (ms)
+constexpr int VIBRO_COOLDOWN_MS = 200;              // Cooldown after vibration before accel read (noise protection)
 
-// --- ПИНЫ (Hardware) ---
-#define BTN_OK 4                        // Ниж-лев: подтверждение/стоп
-#define PIN_VARIO_EN 26                 // Пин управления питанием сенсоров
-#define BTN_DOWN 35                     // Ниж-прав: старт/вниз
-#define BTN_UP 25                       // Верх-прав: назад к часам/вверх
-#define PIN_VIBRO 13                    
-#define PIN_BATT 34                     // АЦП батареи
+// --- GPIO PINS ---
+constexpr int BTN_OK = 4;                          // Bottom-left: confirm/stop
+constexpr int PIN_VARIO_EN = 26;                   // Sensor power control pin
+constexpr int BTN_DOWN = 35;                       // Bottom-right: start/down
+constexpr int BTN_UP = 25;                         // Top-right: back to clock/up
+constexpr int PIN_VIBRO = 13;                       // Vibration motor pin
+constexpr int PIN_BATT = 34;                        // Battery ADC pin
 
-// --- БУЗЗЕР (Brauneiger-style) ---
-// Свободный пин на Watchy V2: GPIO 16, 17, или 32.
-// Внимание: на V1/V1.5 GPIO 32 = UP_BTN, используй 16 или 17.
-#define BUZZER_PIN     32               // Пин буззера (PWM)
-#define BUZZER_CH      1                // LEDC канал
+// --- BUZZER (Brauneiger-style) ---
+// Free pins on Watchy V2: GPIO 16, 17, or 32.
+// Warning: on V1/V1.5 GPIO 32 = UP_BTN, use 16 or 17 instead.
+constexpr int BUZZER_PIN = 32;                     // Buzzer PWM pin
 
-// Настройки тональности (Brauneiger IQ style)
-#define BZ_SILENT_MIN  -0.3f            // Нижняя граница тихой зоны (м/с)
-#define BZ_SILENT_MAX   0.3f            // Верхняя граница тихой зоны (м/с)
-#define BZ_CLIMB_BASE   700              // Базовая частота подъёма (Гц)
-#define BZ_CLIMB_MOD    200              // Прибавка частоты на м/с (Гц)
-#define BZ_CLIMB_MAX    2200             // Макс частота подъёма (Гц)
-#define BZ_SINK_FREQ    500              // Частота снижения (Гц)
-#define BZ_SINK_ALARM  -3.0f             // Порог аварийного снижения (м/с)
-#define BZ_BEAT_BASE    600              // Базовая длительность такта (мс) при vz=0
-#define BZ_BEAT_MIN     80               // Мин длительность такта (мс)
-#define BZ_BEAT_RATE    2.0f             // Коэф ускорения бипов от vz
+// Tone settings (Brauneiger IQ style)
+constexpr float BZ_SILENT_MIN = -0.3f;              // Silent zone lower bound (m/s)
+constexpr float BZ_SILENT_MAX = 0.3f;               // Silent zone upper bound (m/s)
+constexpr int BZ_CLIMB_BASE = 700;                  // Climb base frequency (Hz)
+constexpr int BZ_CLIMB_MOD = 200;                    // Frequency increase per m/s (Hz)
+constexpr int BZ_CLIMB_MAX = 2200;                   // Maximum climb frequency (Hz)
+constexpr int BZ_SINK_FREQ = 500;                    // Sink frequency (Hz)
+constexpr float BZ_SINK_ALARM = -3.0f;               // Emergency sink alarm threshold (m/s)
+constexpr int BZ_BEAT_BASE = 600;                    // Base beat duration (ms) at Vz=0
+constexpr int BZ_BEAT_MIN = 80;                      // Minimum beat duration (ms)
+constexpr float BZ_BEAT_RATE = 2.0f;                 // Beat acceleration factor vs Vz
 
-// --- ДИСПЛЕЙ И I2C ---
-#define EPD_CS 5                        
-#define EPD_RES 9                       
-#define EPD_DC 10                       
-#define EPD_BUSY 19                     
-#define ADDR_BMA 0x18                   
-#define ADDR_RTC 0x51
-#define ACC_INT_1_PIN 14                // BMA423 INT1 (any-motion wake)
-#define RTC_INT_PIN 27                  // PCF8563 INT (alarm wake)
+// --- DISPLAY & I2C ---
+constexpr int EPD_CS = 5;                            // E-Ink chip select
+constexpr int EPD_RES = 9;                           // E-Ink reset
+constexpr int EPD_DC = 10;                           // E-Ink data/command
+constexpr int EPD_BUSY = 19;                         // E-Ink busy
+constexpr uint8_t ADDR_BMA = 0x18;                   // BMA423 I2C address
+constexpr uint8_t ADDR_RTC = 0x51;                   // PCF8563 RTC I2C address
+constexpr int ACC_INT_1_PIN = 14;                    // BMA423 INT1 (any-motion wake)
+constexpr int RTC_INT_PIN = 27;                      // PCF8563 INT (alarm wake)
 
-// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+// --- GLOBAL STATE ---
 enum FsmState { FSM_CLOCK, FSM_SETTINGS, FSM_CALIBRATING, FSM_RUNNING, FSM_STOPPED };
-RTC_DATA_ATTR FsmState fsmStateRTC = FSM_CLOCK;          // FSM состояние через deep sleep
-RTC_DATA_ATTR unsigned long stopwatchElapsed = 0;        // Накопленное время полета
-RTC_DATA_ATTR int lastWakeMinute = -1;                   // Минута последнего пробуждения часов
-RTC_DATA_ATTR int lastWakeDay = -1;                      // День последнего пробуждения (для 1р/день)
-RTC_DATA_ATTR float altCheck = 0.0f;                     // Последняя высота для автостарта (RTC)
-RTC_DATA_ATTR unsigned long motionTime = 0;              // Счётчик wake-ов с движением (RTC)
-RTC_DATA_ATTR bool buzzerEnabled = true;                 // Буззер включён (RTC)
-RTC_DATA_ATTR bool vibroEnabled = true;                  // Вибро включён (RTC)
+RTC_DATA_ATTR FsmState fsmStateRTC = FSM_CLOCK;          // FSM state across deep sleep
+RTC_DATA_ATTR unsigned long stopwatchElapsed = 0;        // Accumulated flight time
+RTC_DATA_ATTR int lastWakeMinute = -1;                   // Last wake minute (for 1/min check)
+RTC_DATA_ATTR float altCheck = 0.0f;                     // Last altitude for auto-start (RTC)
+RTC_DATA_ATTR unsigned long motionTime = 0;              // Motion wake counter (RTC)
+RTC_DATA_ATTR bool buzzerEnabled = true;                 // Buzzer enabled (RTC)
+RTC_DATA_ATTR bool vibroEnabled = true;                  // Vibro enabled (RTC)
 
-// Состояние вариометрной задачи — заменяет все static-переменные
+// Variometer task state machine — replaces all static locals
 struct VarioFsm {
     int pulses = 0;
     bool pulseOn = false;
@@ -130,7 +127,7 @@ struct VarioFsm {
     }
 };
 
-// Runtime FSM данные (не RTC — сбрасываются при каждом wake)
+// Runtime FSM data (not RTC — reset on each wake)
 struct FsmRuntime {
     FsmState state;
     bool lastBtn[3];
@@ -144,7 +141,6 @@ struct SysData {
   float gMagRef;
   bool track, sensInit, accInit;
   unsigned long tStart, tScreen;
-  bool lastSt[3];
 } data;
 
 int rtc_h, rtc_m, rtc_d, rtc_mon;
@@ -153,11 +149,11 @@ GxEPD2_BW<GxEPD2_154_D67, 200> display(GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RES, E
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 TaskHandle_t vTaskH = NULL;
 
-// --- КЛАСС ФИЛЬТРАЦИИ ВАРИОМЕТРА (Gravity-aligned IMU + Baro) ---
-// Вертикаль определяется по фильтрованному вектору ускорения (gravity vector).
-// Проекция текущего ускорения на него даёт альтитудное ускорение независимо
-// от ориентации часов. Комплементарный фильтр: IMU(быстрый) + Baro(точный).
-// Турбулентность — по магнитуде (все оси).
+// --- VARIO FILTER CLASS (Gravity-aligned IMU + Baro) ---
+// Vertical direction determined from filtered accelerometer vector (gravity vector).
+// Projection of current acceleration onto gravity gives vertical acceleration regardless
+// of watch orientation. Complementary filter: IMU (fast) + Baro (accurate).
+// Turbulence computed from magnitude (all axes).
 // Complementary filter: gravity-vector estimation from accelerometer LPF,
 // projected acceleration gives vertical acceleration regardless of watch orientation.
 // Turbulence magnitude computed from all 3 axes (orientation-independent).
@@ -167,12 +163,12 @@ class VarioEMA {
   float altPrev_        = 0.0f;
   float varioFilt_      = 0.0f;
   float accelLinFilt_   = 0.0f;
-  float velInertial_    = 0.0f;   // Интегрированная скорость от акселерометра
-  float velInertialLP_  = 0.0f;   // Low-pass для удаления дрейфа
-  float varioBaroLP_    = 0.0f;   // Low-pass baro-варио
+  float velInertial_    = 0.0f;   // Integrated accelerometer velocity
+  float velInertialLP_  = 0.0f;   // Low-pass for drift removal
+  float varioBaroLP_    = 0.0f;   // Low-pass baro vario
 
   // Gravity vector estimation (LPF on raw accel)
-  float gxEst_ = 0.0f, gyEst_ = 0.0f, gzEst_ = 0.0f;  // Низкочастотная оценка гравитации (G)
+  float gxEst_ = 0.0f, gyEst_ = 0.0f, gzEst_ = 0.0f;  // Low-frequency gravity estimate (G)
 
   bool  inited_       = false;
 
@@ -197,10 +193,10 @@ public:
       inited_        = true;
   }
 
-  // Основной метод обновления фильтра.
-  // ax_raw, ay_raw, az_raw — сырые показания акселерометра (единицы: G, ±8g диапазон)
-  // accelMagMs2            — магнитуда линейного ускорения (м/с²), для турбулентности
-  // baroAlt                — сырая высота с барометра
+  // Main filter update method.
+  // ax_raw, ay_raw, az_raw — raw accelerometer readings (units: G, ±8g range)
+  // accelMagMs2            — linear acceleration magnitude (m/s²), for turbulence
+  // baroAlt                — raw barometer altitude
   float update(float ax_raw, float ay_raw, float az_raw,
                float accelMagMs2, float baroAlt, float dt) {
       if (dt < 0.001f) dt = 0.001f;
@@ -210,14 +206,14 @@ public:
           init(baroAlt);
       }
 
-      // 1. Оценка направления гравитации (LPF вектора акселерометра)
-      //    При любом положении часов этот вектор указывает "вниз"
+      // 1. Gravity direction estimation (LPF of accelerometer vector)
+      //    Regardless of watch orientation, this vector points "down"
       float aGrav = alphaFromTau(dt, CFG_TAU_GRAVITY_VEC);
       gxEst_ += aGrav * (ax_raw - gxEst_);
       gyEst_ += aGrav * (ay_raw - gyEst_);
       gzEst_ += aGrav * (az_raw - gzEst_);
 
-      // Нормализация gravity vector
+      // Normalize gravity vector
       float gNorm = sqrtf(gxEst_*gxEst_ + gyEst_*gyEst_ + gzEst_*gzEst_);
       if (gNorm > 0.001f) {
           float invG = 1.0f / gNorm;
@@ -228,24 +224,24 @@ public:
           gxEst_ = 0.0f; gyEst_ = 0.0f; gzEst_ = 1.0f;
       }
 
-      // 2. Проекция текущего ускорения на гравитацию => линейное ускорение по вертикали
+      // 2. Project current acceleration onto gravity => vertical linear acceleration
       float accelVerticalG = ax_raw*gxEst_ + ay_raw*gyEst_ + az_raw*gzEst_ - 1.0f;
       if (fabsf(accelVerticalG) < 0.02f) accelVerticalG = 0.0f; // deadzone
       float azMs2 = accelVerticalG * GRAVITY_G;
 
-      // 3. Фильтрация магнитуды ускорения (для турбулентности)
+      // 3. Filter acceleration magnitude (for turbulence)
       float aAcc = alphaFromTau(dt, CFG_TAU_ACCEL);
       accelLinFilt_ += aAcc * (accelMagMs2 - accelLinFilt_);
 
-      // 4. Фильтрация высоты
+      // 4. Altitude filtering
       float aAlt = alphaFromTau(dt, CFG_TAU_BARO_ALT);
       altFilt_ += aAlt * (baroAlt - altFilt_);
 
-      // 5. Baro-варио (производная высоты)
+      // 5. Baro vario (altitude derivative)
       float varioRaw = (altFilt_ - altPrev_) / dt;
       altPrev_ = altFilt_;
 
-      // 6. Адаптация tau варио по турбулентности
+      // 6. Adapt vario tau based on turbulence
       float turb = fabsf(accelLinFilt_);
       float turbNorm = 0.0f;
       if (CFG_ACCEL_TURB_REF > 0.0f) {
@@ -255,16 +251,16 @@ public:
       float tauVario = CFG_TAU_BARO_VARIO_BASE + turbNorm * CFG_TAU_BARO_VARIO_TURB;
       float aVario = alphaFromTau(dt, tauVario);
 
-      // 7. Low-pass baro-варио (для комплементарного фильтра)
+      // 7. Low-pass baro vario (for complementary filter)
       varioBaroLP_ += aVario * (varioRaw - varioBaroLP_);
 
-      // 8. Комплементарный фильтр: IMU + Baro
-      velInertial_ += azMs2 * dt;                    // Интеграция вертикального ускорения
+      // 8. Complementary filter: IMU + Baro
+      velInertial_ += azMs2 * dt;                    // Integrate vertical acceleration
 
       float aComp = alphaFromTau(dt, CFG_TAU_COMPLEMENTARY);
-      velInertialLP_ += aComp * (velInertial_ - velInertialLP_);  // Дрейф
+      velInertialLP_ += aComp * (velInertial_ - velInertialLP_);  // Drift estimation
 
-      float velInertialHP = velInertial_ - velInertialLP_;        // HP = без дрейфа
+      float velInertialHP = velInertial_ - velInertialLP_;        // HP = drift-free
 
       varioFilt_ = velInertialHP + varioBaroLP_;                  // Fusion
 
@@ -278,7 +274,7 @@ public:
   float getVario()    const { return varioFilt_ * CFG_VARIO_SENS; }
   float getAccelLin() const { return accelLinFilt_; }
 
-  // Доступ к оценке гравитации (для отладки)
+  // Access to gravity estimate (for debugging)
   void getGravityEst(float &gx, float &gy, float &gz) const {
       gx = gxEst_; gy = gyEst_; gz = gzEst_;
   }
@@ -286,7 +282,7 @@ public:
 
 VarioEMA varioEMA;
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+// --- HELPER FUNCTIONS ---\r
 void i2cWrite(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
@@ -309,7 +305,7 @@ void readRTC() {
   }
 }
 
-// Установка RTC alarm на +N секунд от текущего времени
+// Set RTC alarm N seconds from now
 // BCD (Binary-Coded Decimal) registers: each nibble = one decimal digit.
 // Alarm registers 0x0A-0x0E: 0x80 means "don't care" for that field.
 // Setting minute alarm with 0x80 bit = match only minutes, ignore seconds.
@@ -318,19 +314,19 @@ void setRTCAlarmSec(int secFromNow) {
   Wire.requestFrom(ADDR_RTC, 6);
   uint8_t s=0, m=0, h=0, d=0, wd=0, mon=0;
   if(Wire.available()) {
-     s = Wire.read() & 0x7F;  // секунды
-     m = Wire.read() & 0x7F;  // минуты
-     h = Wire.read() & 0x3F;  // часы
-     d = Wire.read() & 0x3F;  // день
-     wd = Wire.read() & 0x07; // день недели
-     mon = Wire.read() & 0x1F;// месяц
+     s = Wire.read() & 0x7F;  // seconds
+     m = Wire.read() & 0x7F;  // minutes
+     h = Wire.read() & 0x3F;  // hours
+     d = Wire.read() & 0x3F;  // day
+     wd = Wire.read() & 0x07; // weekday
+     mon = Wire.read() & 0x1F;// month
   }
-  // Добавляем секунды
+  // Add offset seconds
   uint8_t dec_s = (s >> 4) * 10 + (s & 0x0F);
   uint8_t dec_m = (m >> 4) * 10 + (m & 0x0F);
   uint8_t dec_h = (h >> 4) * 10 + (h & 0x0F);
   unsigned long totalSec = dec_h * 3600UL + dec_m * 60UL + dec_s + secFromNow;
-  // Обработка переполнения через сутки
+  // Handle day overflow
   if (totalSec >= 86400UL) totalSec -= 86400UL;
   uint8_t newH = totalSec / 3600;
   uint8_t newM = (totalSec % 3600) / 60;
@@ -339,7 +335,7 @@ void setRTCAlarmSec(int secFromNow) {
   uint8_t bcdS = ((newS / 10) << 4) | (newS % 10);
   uint8_t bcdM = ((newM / 10) << 4) | (newM % 10);
   uint8_t bcdH = ((newH / 10) << 4) | (newH % 10);
-  // Записываем alarm
+  // Write alarm registers
   Wire.beginTransmission(ADDR_RTC);
   Wire.write(0x09); // control/status2
   Wire.write(0x02); // enable alarm, clear AF flag
@@ -349,7 +345,7 @@ void setRTCAlarmSec(int secFromNow) {
   Wire.write(0x80); // 0x0D: day alarm (0x80 = disable)
   Wire.write(0x80); // 0x0E: weekday alarm (disable)
   Wire.endTransmission();
-  // Включаем alarm interrupt в control/status1
+  // Enable alarm interrupt in control/status1
   Wire.beginTransmission(ADDR_RTC); Wire.write(0x00); Wire.endTransmission();
   Wire.requestFrom(ADDR_RTC, 1);
   uint8_t cs1 = 0;
@@ -359,18 +355,18 @@ void setRTCAlarmSec(int secFromNow) {
   Wire.endTransmission();
 }
 
-// Инициализация BMA423 any-motion interrupt для пробуждения из сна
+// Initialize BMA423 any-motion interrupt for wake from sleep
 // BMA423 register 0x7C = feature config (0x00 = off, 0x04 = any-motion).
 // Reg 0x40 = INT1 config (0x38 = push-pull active low).
 // Reg 0x41 = INT1 mapping (0x01 = any-motion on INT1).
 void initBMAMotionWake() {
-  // Устанавливаем any-motion детекцию
+  // Enable any-motion detection: config off → set INT1 → enable
   i2cWrite(ADDR_BMA, 0x7C, 0x00); // feature config off
   delay(5);
-  // Конфиг any-motion через feature config
-  i2cWrite(ADDR_BMA, 0x40, 0x38); // INT1: active low, push-pull
+  // Set INT1: active low, push-pull
+  i2cWrite(ADDR_BMA, 0x40, 0x38); // INT1 config
   i2cWrite(ADDR_BMA, 0x41, 0x01); // INT1 map: any-motion → INT1
-  // Включаем any-motion detection
+  // Enable any-motion feature
   i2cWrite(ADDR_BMA, 0x7C, 0x04);
   delay(10);
 }
@@ -383,7 +379,7 @@ void initSensors() {
         bmp.setOutputDataRate(BMP3_ODR_50_HZ);
         data.sensInit = true;
     }
-    // Настройка акселерометра BMA (Reset, Config, Enable)
+    // Configure BMA423 accelerometer (Reset, Config, Enable)\r
     i2cWrite(ADDR_BMA, 0x7E, 0xB6); delay(20);
     i2cWrite(ADDR_BMA, 0x7C, 0x00); delay(10);
     i2cWrite(ADDR_BMA, 0x40, 0x28);
@@ -394,7 +390,7 @@ void initSensors() {
 
 void drawItem(int x, int y, const GFXfont* f, String txt) {
     display.setFont(f);
-    if (x < 0) { // Центрирование по горизонтали
+    if (x < 0) { // Center horizontally
         int16_t x1, y1; uint16_t w, h;
         display.getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
         x = (display.width() - w) / 2;
@@ -402,8 +398,8 @@ void drawItem(int x, int y, const GFXfont* f, String txt) {
     display.setCursor(x, y); display.print(txt);
 }
 
-// --- ЗАДАЧА ВАРИОМЕТРА (FreeRTOS Task) ---
-// Все состояния хранятся в vfsm (VarioFsm), не в static locals
+// --- VARIOMETER TASK (FreeRTOS) ---
+// All state in vfsm (VarioFsm), no static locals
 void varioTask(void *p) {
     for(;;) {
         if (fsmStateRTC == FSM_RUNNING && data.sensInit) {
@@ -459,7 +455,7 @@ void varioTask(void *p) {
                 // reqP == 0: silence
                 // reqP > 0: burst of N pulses, each V_PULSE ms on, V_GAP ms gap,
                 //           V_PAUSE ms between bursts. Follows 1:1 on/off ratio.
-                // --- ЛОГИКА ГЕНЕРАЦИИ ИМПУЛЬСОВ ---
+                // --- PULSE GENERATION ---
                 int reqP = 0;
                 float v_check = vfsm.vSmooth;
 
@@ -494,7 +490,7 @@ void varioTask(void *p) {
                     } else { setVibro = vfsm.pulseOn; }
                 }
 
-                // Управление вибро
+                // Vibro control
                 if (setVibro && vibroEnabled) {
                     digitalWrite(PIN_VIBRO, 1); vfsm.vibroActive = true;
                 } else {
@@ -507,7 +503,7 @@ void varioTask(void *p) {
                 // beat cadence accelerates with climb. 1:1 pulse/pause ratio.
                 // Sink alarm: continuous tone below BZ_SINK_ALARM (-3 m/s).
                 // Silent zone: ±0.3 m/s deadband.
-                // --- БУЗЗЕР ---
+                // --- BUZZER ---
                 unsigned long bzNow = millis();
                 float bzV = vfsm.vSmooth;
                 if (buzzerEnabled) {
@@ -582,14 +578,14 @@ void drawMain() {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
 
-        // Время полета
+        // Flight time
         unsigned long t = stopwatchElapsed + (fsmStateRTC == FSM_RUNNING ? (millis()-data.tStart)/1000 : 0);
         sprintf(buf, "%02lu:%02lu:%02lu", t/3600, (t%3600)/60, t%60);
         drawItem(10, 20, &FreeSansBold9pt7b, buf);
 
         sprintf(buf, "%.1fc", dTemp); drawItem(80, 20, &FreeSansBold9pt7b, buf);
 
-        // Заряд батареи
+        // Battery charge
         // LiPo linear approximation: 3.3V=0%, 4.2V=100%. Inaccurate mid-range but sufficient.
         // analogReadMilliVolts returns mV, /1000 = V, *2 = voltage divider correction (/2 on PCB).
         float v = analogReadMilliVolts(PIN_BATT)/1000.0*2.0;
@@ -614,8 +610,8 @@ void drawMain() {
     } while (display.nextPage());
 }
 
-void drawClock(bool deep) {
-    if(deep) { display.init(115200, true, 2, false); display.setFullWindow(); }
+void drawClock(bool fullInit) {
+    if(fullInit) { display.init(115200, true, 2, false); display.setFullWindow(); }
     else display.setPartialWindow(0,0,200,200);
 
     display.firstPage();
@@ -715,8 +711,8 @@ void goDeepSleep() {
     ledcDetach(BUZZER_PIN);
     display.hibernate(); Wire.end(); WiFi.mode(WIFI_OFF);
 
-    // Пробуждение: кнопка BACK (GPIO25), RTC alarm (GPIO27), BMA motion (GPIO14)
-    // Все активны при LOW (кнопка → GND, RTC INT → open-drain, BMA INT → active low)
+    // Wake sources: BTN_UP (GPIO25), RTC alarm (GPIO27), BMA motion (GPIO14)
+    // All active LOW (button → GND, RTC INT → open-drain, BMA INT → active low)
     // EXT1 wake sources: BTN_UP, RTC alarm, BMA motion.
     // All active LOW. ESP_EXT1_WAKEUP_ALL_LOW = all selected pins must be LOW.
     // BTN_OK and BTN_DOWN cannot wake the device from deep sleep.
@@ -737,63 +733,59 @@ void setup() {
     digitalWrite(PIN_VARIO_EN, 0);
     digitalWrite(PIN_VIBRO, 0);
 
-    // Инициализация буззера (PWM) — API ESP32 Core 3.x
-    ledcAttach(BUZZER_PIN, BZ_CLIMB_BASE, 8);  // канал не нужен, пин сам становится PWM
-    ledcWrite(BUZZER_PIN, 0);                   // беззвучно
+    // Initialize buzzer (PWM) — ESP32 Core 3.x API
+    ledcAttach(BUZZER_PIN, BZ_CLIMB_BASE, 8);  // pin IS the channel in Core 3.x
+    ledcWrite(BUZZER_PIN, 0);                   // silent at startup
 
     Wire.begin();
-    display.init(115200, true, 2, false);
-    display.setRotation(1);
     setCpuFrequencyMhz(80);
     WiFi.mode(WIFI_OFF);
 
     readRTC();
 
-    // Восстанавливаем runtime FSM state из RTC
+    // Restore runtime FSM state from RTC
     fsm.state = fsmStateRTC;
 
-    // Определяем причину пробуждения
-    // Wake reason determines behavior:
-    // - ESP_SLEEP_WAKEUP_UNDEFINED = first boot → show clock
-    // - BTN_UP wake → user wants to see clock
-    // - RTC_INT_PIN → timed check: 1 BMP read for flight detection
-    // - ACC_INT_1_PIN → motion wake → show clock
-    // FSM_RUNNING on wake = anomaly (deep sleep shouldn't happen mid-flight)
+    // Determine wake cause, then init display with proper reset behavior:
+    // - First boot (ESP_SLEEP_WAKEUP_UNDEFINED): full display init with reset
+    // - Normal wake: skip reset to avoid ghosting
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    display.init(115200, true, 2, (cause == ESP_SLEEP_WAKEUP_UNDEFINED));
+    display.setRotation(1);
     uint64_t wakePin = 0;
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
         wakePin = esp_sleep_get_ext1_wakeup_status();
     }
 
     if (fsmStateRTC == FSM_RUNNING && cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
-        // Проснулись во время полёта — нештатная ситуация, идём в CLOCK
+        // Wake from sleep during flight — anomaly, fall back to CLOCK
         fsmStateRTC = FSM_CLOCK;
         fsm.state = FSM_CLOCK;
     }
 
     if (fsmStateRTC == FSM_CLOCK) {
         if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
-            // Первый запуск после подачи питания — показываем часы
+            // First boot — show clock
             drawClock(true);
             fsmStateRTC = FSM_CLOCK;
             fsm.state = FSM_CLOCK;
-            // Идём в loop()
+            // Go to loop()
         }
         else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
             if (wakePin & BIT64(BTN_UP)) {
-                // Пробуждение по кнопке UP — показываем часы
+                // Wake by UP button — show clock
                 drawClock(true);
                 fsmStateRTC = FSM_CLOCK;
                 fsm.state = FSM_CLOCK;
             }
             else if (wakePin & BIT64(RTC_INT_PIN)) {
-                // Пробуждение по RTC alarm (раз в минуту)
+                // Wake by RTC alarm (every minute)
                 readRTC();
                 if (rtc_m != lastWakeMinute || lastWakeMinute < 0) {
                     lastWakeMinute = rtc_m;
-                    drawClock(false);
+                    drawClock(false);  // partial refresh from wake
                 }
-                // Быстрая проверка: 1 чтение BMP
+                // Quick flight check: 1 BMP reading
                 digitalWrite(PIN_VARIO_EN, 1);
                 delay(10);
                 if (bmp.begin_I2C(0x77) || bmp.begin_I2C(0x76)) {
@@ -824,7 +816,7 @@ void setup() {
                 fsm.state = FSM_CLOCK;
             }
             else if (wakePin & BIT64(ACC_INT_1_PIN)) {
-                // Пробуждение по движению
+                // Wake by motion (BMA any-motion)
                 drawClock(true);
                 fsmStateRTC = FSM_CLOCK;
                 fsm.state = FSM_CLOCK;
@@ -835,7 +827,7 @@ void setup() {
     }
 
     if (fsmStateRTC == FSM_RUNNING) {
-        // Восстановление после глубокого сна в RUNNING — переходим в CLOCK
+        // Restored from deep sleep in RUNNING — fall back to CLOCK
         fsm.state = FSM_CLOCK;
         fsmStateRTC = FSM_CLOCK;
         drawClock(true);
