@@ -1,325 +1,318 @@
-### 1. Brief Device Description
+# VibroVarioAuto — Pilot Manual
 
-The device is a compact barometric variometer with an e‑ink display and haptic (vibratory) feedback, optimized for use with paragliders, hang gliders, sailplanes, and similar applications.
-
-Its core functions are:
-
-- Measurement of **barometric altitude** and **vertical speed (variometer)**;
-- Display of:
-  - Flight time (stopwatch),
-  - Current and relative altitude (with respect to launch point),
-  - Maximum climb and sink rate attained during the flight,
-  - Ambient temperature,
-  - Battery voltage and state-of-charge,
-  - Current time and date (from RTC);
-- Haptic feedback for climb/sink detection (enabling hands‑free situational awareness);
-- Low-power operation: implemented via e‑ink display, ESP32 hardware deep sleep, sensor and Wi‑Fi power gating.
+**Firmware version:** 1.5e  
+**Fork of:** [VibroVario](https://github.com/isemaster/VibroVario) by isemaster  
+**License:** MIT
 
 ---
 
-### 2. Operational Principles (Software Perspective)
+## 1. What It Is
 
-#### 2.1. Hardware Architecture (as per firmware)
+VibroVarioAuto is a barometric variometer for paragliders, hang gliders, and sailplanes, built on the Watchy smartwatch platform (ESP32 + E-Ink display).
 
-- **MCU**: ESP32.
-- **Barometric sensor**: BMP3XX (I²C address 0x76 or 0x77).
-- **Accelerometer**: BMA423 (I²C address 0x18).
-- **Real‑Time Clock (RTC)**: I²C address 0x51 (e.g., PCF8563 or equivalent).
-- **Display**: 1.54" monochrome e‑paper GDEH0154D67 (200×200 px, driven by GxEPD2 library).
-- **Vibrator motor**: connected to GPIO `PIN_VIBRO = 13`.
-- **User buttons**:
-  - `BTN_SELECT = 35` — launch calibration / start flight,
-  - `BTN_RIGHT = 4` — stop flight / auxiliary function in clock mode,
-  - `BTN_BACK = 25` — wake-up / enter deep sleep (on/off).
-- **Battery monitoring**: analog ADC input `PIN_BATT = 34`, using a voltage divider (×2 attenuation).
+### Key Differences from Other Variometers
+
+- **Silent mode** — wrist vibration motor, no beeping
+- **Sound mode** — optional buzzer with Brauneiger-style tones
+- **E-Ink screen** — readable in direct sunlight, zero power when idle
+- **Power saving** — weeks in clock mode, 10+ hours in flight
+- **Smart sleep** — auto-wakes every minute to check if you've launched
+- **Weight** — only 24 g with battery
 
 ---
 
-#### 2.2. Operating Modes (States)
+## 2. Hardware Sensors
 
-The firmware implements the following logical states:
+| Sensor | Measures | Purpose |
+|--------|----------|---------|
+| BMP390 | Air pressure | Altitude and vertical speed |
+| BMA423 | Acceleration (3-axis) | Fast filter response + tilt compensation |
+| PCF8563 | Precise time | RTC, survives deep sleep |
+| Vibration motor | — | Tactile feedback on wrist |
 
-- **`SLEEP`**: Deep-sleep mode  
-  - Power to the variometer circuitry and vibrator is disabled,  
-  - Display is placed in hibernate mode,  
-  - I²C bus and Wi‑Fi are powered down,  
-  - ESP32 enters hardware deep sleep and wakes **only** upon `BTN_BACK` press (rising edge).
+### How Sensors Work Together
 
-- **`IDLE`**: Clock / standby mode  
-  - Battery voltage, current time, and date are shown on the e‑ink display,  
-  - After 60 seconds of inactivity, the device automatically transitions to `SLEEP`,  
-  - From here, a new flight can be initiated (`SELECT`) or the RTC time can be zeroed (`RIGHT`, for diagnostics only).
+**Barometer (BMP390)** samples at 50 Hz. Altitude is computed from pressure using standard atmosphere formula (1013.25 hPa reference).
 
-- **`RUNNING`**: Active flight mode  
-  - Sensors are powered and actively sampled,  
-  - A dedicated background task runs at ~50 Hz,  
-  - Updates include: altitude, vertical speed, haptic feedback, flight timer, and max/min climb/sink records.
+**Accelerometer (BMA423)** provides two benefits:
+1. **Gravity direction** — regardless of watch orientation, the gravity vector is tracked via LPF (2s time constant)
+2. **Fast response** — acceleration is projected onto the gravity vector, giving instant vertical acceleration before baro catches up
 
-- **`STOPPED`**: Post‑flight state  
-  - Sensors remain initialized but data acquisition is paused,  
-  - Haptic output is disabled,  
-  - Display shows frozen flight statistics,  
-  - From here one may either:
-    - Begin a new flight (`SELECT`), or
-    - Enter `SLEEP` (`BACK`).
+**Fusion**: Complementary filter — IMU (fast, drifts) high-pass + Baro (slow, accurate) low-pass.
 
 ---
 
-#### 2.3. Measurement Pipeline and Algorithms
+## 3. Screen Reference
 
-##### 2.3.1. Barometric Altitude
+### Clock Screen (CLOCK mode)
 
-- BMP3XX initialization settings:
-  - Temperature oversampling: ×4,
-  - Pressure oversampling: ×8,
-  - IIR filter coefficient: 3,
-  - Output data rate: 50 Hz.
-- Each processing cycle:
-  ```cpp
-  bmp.performReading();
-  altitude = bmp.readAltitude(SEALEVELPRESSURE_HPA);
-  ```
-  where `SEALEVELPRESSURE_HPA = 1012.5` hPa (fixed reference QNH).
-
-Thus, the device reports **barometric altitude relative to a fixed sea‑level pressure**. While absolute “Sea, m” may deviate from true local QNH, relative altitude and variometer outputs remain accurate for flight purposes.
-
----
-
-##### 2.3.2. Accelerometer and Tilt Compensation
-
-Raw accelerometer data (±4 g range) are converted to units of *g*:
-```cpp
-ax = rx / 8192.0f; // same for ay, az
+```
+┌──────────────────────┐
+│  3.95V   87%         │    ← battery voltage and charge %
+│                      │
+│       14:32          │    ← current time (large)
+│                      │
+│      01.05           │    ← date (day.month)
+│                      │
+└──────────────────────┘
 ```
 
-Tilt‑independent vertical acceleration is derived as follows:
+### Flight Screen (RUNNING mode)
 
-1. Compute the magnitude of the 3‑axis acceleration vector:
-   ```cpp
-   acc_mag = sqrt(ax*ax + ay*ay + az*az);
-   ```
-   This value is invariant to device orientation (≈ 1 g at rest).
+```
+┌──────────────────────┐
+│ 00:12:34  24.5c  87% │    ← flight time | °C | battery
+│                      │
+│ Start, m    Sea, m   │    ← headers
+│    +245       589    │    ← climb from start | altitude MSL
+│                      │
+│ Vario  max+3.2 min-1.1│   ← flight statistics
+│        +1.7          │    ← VERTICAL SPEED (large)
+└──────────────────────┘
+```
 
-2. During calibration, a reference magnitude `gMagRef` (device‑specific 1 g baseline) is stored.
+**Top line:** flight time (hh:mm:ss), temperature (°C), battery %
+**Middle:** relative altitude from start (`Start, m`) and barometric MSL altitude (`Sea, m`)
+**Bottom:** `Vario` label, max/min climb/sink rates, current vertical speed (±m/s)
 
-3. In flight, vertical linear acceleration (in *g*) is estimated via:
-   ```cpp
-   acc_linear_g = acc_mag - data.gMagRef;
-   ```
-   - Positive values indicate >1 g (e.g., active climb),
-   - Negative values indicate <1 g (e.g., sink or stall).
+### Settings Screen
 
-4. Conversion to SI units:
-   ```cpp
-   acc_vert_input = acc_linear_g * 9.80665; // m/s²
-   ```
+```
+┌──────────────────────┐
+│      Settings        │
+│                      │
+│   Buzzer: [ON]       │
+│                      │
+│   Vibro: [OFF]       │
+│                      │
+│  OK-toggle UP-exit   │
+└──────────────────────┘
+```
 
-> **Note**: During vibrator activation, accelerometer data are **temporarily ignored** to avoid motion artifacts. A 250 ms cooldown period follows deactivation before accelerometer data are trusted again.
+**Controls in SETTINGS:**
 
----
+| Button | Action |
+|--------|--------|
+| OK | Toggle: Buzzer ON/OFF → Vibro ON/OFF → ... |
+| DOWN | Reset both to ON |
+| UP | Exit to clock (CLOCK) |
 
-##### 2.3.3. Kalman Filter: Fusion of Barometric and Inertial Data
+Settings persist across deep sleep (stored in RTC memory).
 
-A three‑state `VarioKalman` filter estimates:
-- *z* = altitude (m),  
-- *vz* = vertical speed (m/s),  
-- *bias_z* = accelerometer bias (m/s²).
+### Self-Test Screen
 
-Inputs per cycle:
-- `acc_vert_input` (vertical acceleration from accelerometer),
-- `baro_alt` (barometric altitude),
-- `dt` (time interval, derived from `micros()`).
+On every button wake (UP/OK/DOWN), the device runs a self-check:
 
-Filter operation:
-- **Prediction step**: integrates acceleration to update velocity and altitude,
-- **Correction step**: adjusts state estimates using barometric altitude to suppress long‑term drift and resolve sign ambiguity,
-- Bias modeling: includes a slow-varying bias term for improved robustness.
+| Check | Method | On failure shows |
+|-------|--------|-----------------|
+| DOWN, OK buttons | Check if stuck | `BTN: DOWN OK` |
+| BMP390 barometer | I2C communication | `BARO FAIL` |
+| BMA423 accelerometer | Chip ID register | `ACCEL FAIL` |
+| Battery | Voltage < 3.4V | `LOW BATT` |
+| BMP390 in flight | 50 Hz reads | `SENSOR FAIL` overlay |
 
-Sensitivity tuning is performed via two configurable parameters:
-- `SENS_BARO_NOISE` — smaller values increase trust in barometer (higher variometer sensitivity, increased noise),
-- `SENS_ACCEL_TRUST` — larger values increase reliance on accelerometer dynamics (faster response to transients, less smoothing).
-
-Filter outputs:
-- `kalman.getAltitude()` → `data.alt` (smoothed altitude),
-- `kalman.getVario()` → `data.vel` (vertical speed, limited to ±25 m/s for outlier rejection).
-
----
-
-##### 2.3.4. Pre‑Flight Calibration
-
-Triggered by pressing `SELECT` in `IDLE`/`STOPPED`:
-
-1. Sensor power is enabled (`PIN_VARIO_EN = 1`), BMP3XX and BMA423 are initialized.
-2. Display shows **“Calibrating…”**.
-3. Over ~1 second:
-   - 100 accelerometer samples are acquired,
-   - Magnitude of each sample is computed,
-   - Mean of magnitudes yields `data.gMagRef`,
-   - Kalman filter is updated several times with zero acceleration to stabilize altitude estimate.
-4. Safeguard: if `gMagRef` falls outside [0.5 g, 1.5 g], fallback value `1.0 g` is used.
-
-Subsequent actions:
-- `startAlt` is set to the current smoothed altitude,
-- Max/min variometer records are reset,
-- Stopwatch starts from zero,
-- Background task `varioTask` is launched (if not already active),
-- State transitions to `RUNNING`.
-
-**Conclusion**: Calibration must be performed with the device stationary and free of vibration.
+If all OK — self-test passes silently.
+If issue found — **SELF-TEST** screen displayed for 5 seconds, then clock screen.
 
 ---
 
-##### 2.3.5. Flight‑Mode Display (`drawMain()`)
+## 4. Operating Modes (FSM)
 
-Screen refreshes once per second and shows:
+The device has 5 states:
 
-- **Top line**:
-  - *Flight timer* (hh:mm:ss since launch, cumulative across pauses),
-  - *Ambient temperature* (°C, one decimal),
-  - *Battery state*:  
-    - Voltage measured via ADC (accounting for ×2 divider),  
-    - Linear mapping: 3.3 V → 0 %, 4.2 V → 100 %.
+```
+    ┌──────────┐
+    │  CLOCK   │ ◄──── deep sleep / wake
+    └────┬─────┘
+         │
+    ┌────▼──────┐   ┌────────────┐
+    │ SETTINGS  │   │ CALIBRATING│
+    └────▲──────┘   └─────┬──────┘
+         │                │
+    ┌────┴──────────┐     │
+    │   RUNNING     │◄────┘
+    │ (vario active)│
+    └──────┬───────-┘
+           │
+    ┌──────▼───────-┐
+    │   STOPPED     │
+    │ (stats frozen)│
+    └──────┬───────-┘
+           │
+      (back to CLOCK)
+```
 
-- **Middle section** (in `RUNNING`/`STOPPED`):
-  - Header: `Start, m   Sea, m`
-  - Left: **Relative altitude** (current altitude − launch altitude, signed),
-  - Right: **Barometric altitude above sea level** (integer m).
+### DEEP SLEEP
 
-- **Bottom section**:
-  - Label `"Vario"`,
-  - (After 5 s into flight, `data.track == true`):  
-    `max+X.X min−Y.Y` — peak climb and sink rates to date,
-  - Large font: **Current vertical speed** (m/s, one decimal, signed ±).
+Consumption: **~5 µA** (battery lasts months).
 
----
+- Screen blank, all sensors off
+- Wake by **any button**: UP, OK, or DOWN (SETUP = sensor power pin, does not wake)
+- Self-test runs on wake
+- Auto-entry: after 5 min idle in CLOCK
 
-#### 2.4. Haptic Feedback Logic
+### CLOCK — Clock Mode
 
-Implemented in `varioTask` (~50 Hz loop), haptic output is derived from `data.vel`:
+Consumption: **~30 µA** average.
 
-- **Strong sink** (`v ≤ SINK_TRH = −5.0 m/s`): continuous vibration (warning).
-- **Climb**: discrete pulse patterns based on speed thresholds:
+- Shows time, date, battery
+- Sleeps most of the time, wakes for ~0.1s every 60s for 1 BMP reading
+- Auto-detects launch: if Vz > 0.75 m/s since last check → shows "FLIGHT!"
+- Also wakes on motion (accelerometer any-motion interrupt)
+- **Buttons in CLOCK:** DOWN → Settings, OK → Start flight, UP → Deep sleep
 
-  | Speed Range (m/s) | Pulses per Series |
-  |-------------------|-------------------|
-  | 0.2 – 0.4         | 1                 |
-  | 0.4 – 0.8         | 2                 |
-  | 0.8 – 1.4         | 3                 |
-  | 1.4 – 2.0         | 4                 |
-  | > 2.0             | 0 (no vibration in current firmware) |
+### CALIBRATING — Pre-Flight Calibration
 
-  Pulse parameters:
-  - Pulse width: `V_PULSE = 50 ms`,
-  - Inter‑pulse gap: `V_GAP = 125 ms`,
-  - Inter‑series interval: `V_PAUSE = 1000 ms`,
-  - Post‑vibration cooldown (before re‑enabling accelerometer): `VIBRO_COOLDOWN_MS = 250 ms`.
+- Sensors powered, 2-second calibration
+- Accelerometer G-reference captured
+- Filter stabilizes altitude
+- Transitions to RUNNING when done
 
-- **Weak motion** (`|v| < 0.2 m/s`): no haptic output.
+### RUNNING — Flight Mode
 
----
+Consumption: **~7 mA** (buzzer adds ~3 mA).
 
-#### 2.5. Power Management and Energy Saving
+- All sensors active: baro 50 Hz, accelerometer, display, buzzer, vibration
+- Vertical speed updated in real-time (complementary filter)
+- Display refreshes 1x/sec (E-Ink is slow)
+- Buzzer and vibro run continuously
 
-- In `goDeepSleep()`:
-  - Variometer task is deleted,
-  - Sensor and vibrator power (`PIN_VARIO_EN`) is disabled,
-  - Display hibernated,
-  - I²C bus released,
-  - Wi‑Fi fully deinitialized,
-  - Wake‑up configured on `BTN_BACK`,
-  - `esp_deep_sleep_start()` invoked.
+**Auto-landing:** if Vz < 0.75 m/s and no motion for 5 minutes → auto-transition to CLOCK.
 
-- In `IDLE` (clock mode):
-  - Variometer sensors remain powered off until flight start,
-  - e‑ink updates only on state transitions,
-  - 60 s inactivity → automatic transition to `SLEEP`.
+### STOPPED — Flight Paused
 
----
-
-### 3. Pilot’s Operating Instructions
-
-#### 3.1. Controls and Indications (Summary)
-
-| Button   | Function(s)                                                                                     |
-|----------|--------------------------------------------------------------------------------------------------|
-| **BACK** | - Power on/off (wake from `SLEEP`),<br>- From any state: enter `IDLE` → auto‑sleep after 60 s |
-| **SELECT**| - In `IDLE`/`STOPPED`: initiate calibration & start flight (`RUNNING`)                         |
-| **RIGHT**| - In `RUNNING`: stop flight → `STOPPED`,<br>- In `IDLE`: reset RTC to 00:00 (diagnostic only) |
-
-**Flight Screen Layout**:
-- **Top line**: flight timer, temperature, battery %  
-- **Middle**: `Start, m` (relative altitude), `Sea, m` (barometric altitude)  
-- **Bottom**: `"Vario"` label, max/min rates, large current vertical speed (±m/s)
+- All readings frozen, stopwatch stopped
+- Sensors powered down to save battery
+- UP → exit to CLOCK, DOWN → new flight, OK → reset RTC to 00:00
 
 ---
 
-#### 3.2. Pre‑Flight Preparation
+## 5. Button Reference
 
-1. **Battery check**:  
-   - In `IDLE`, voltage and SoC are displayed;  
-   - ≥ 4.2 V ≈ 100 %, ≤ 3.3 V ≈ critically low.
+| Button | GPIO | Position | CLOCK | RUNNING | STOPPED | SETTINGS |
+|--------|------|----------|-------|---------|---------|----------|
+| SETUP | 26 | Top-left | — (sensor power) | — | — | — |
+| UP | 25 | Top-right | Go to sleep | Exit to CLOCK | Exit to CLOCK | Exit to CLOCK |
+| OK | 4 | Bottom-left | Start flight | Stop flight | Reset RTC | Toggle ON/OFF |
+| DOWN | 35 | Bottom-right | Settings | — | New flight | Reset to ON |
 
-2. **Power on**: Press **BACK** → device wakes and shows clock screen.
-
-3. **Mounting**: Secure the unit with minimal vibration (e.g., in harness pocket or on wrist); ensure you can feel vibrations clearly.
-
----
-
-#### 3.3. Launch and Calibration
-
-1. With clock screen active, press **SELECT**.  
-2. **“Calibrating…”** appears — *do not move the device* (~1–2 s).  
-   - Barometric altitude is sampled,  
-   - Accelerometer is calibrated to local 1 g.  
-3. Upon completion, the display switches to flight mode (`RUNNING`):  
-   - Stopwatch starts,  
-   - `Start, m` = 0 at current altitude.
+**Wake from deep sleep:** Any button (UP/OK/DOWN). SETUP does not wake.
 
 ---
 
-#### 3.4. In‑Flight Operation
+## 6. Flight Workflow
 
-**Key indicators**:
-- **Timer**: top-left,
-- **Temperature & battery**: top-center/right,
-- **Relative altitude (`Start, m`)**: positive → above launch, negative → below,
-- **`Sea, m`**: altitude above fixed sea‑level reference (may differ from true QNH),
-- **Variometer**: large value (± m/s), with recorded max/min climb/sink.
+### Before Flight
 
-**Haptic cues**:
-- **Continuous vibration** ⇒ strong sink (> 5 m/s), indicating urgent descent.
-- **Pulsed vibration** ⇒ climb:
-  - 1 pulse: weak lift (0.2–0.4 m/s),
-  - 2 pulses: moderate (0.4–0.8 m/s),
-  - 3 pulses: strong (0.8–1.4 m/s),
-  - 4 pulses: very strong (1.4–2.0 m/s),
-  - > 2.0 m/s: no vibration (screen still shows value).
-- **No vibration** ⇒ near‑neutral vertical movement (< 0.2 m/s) *or* very strong lift (> 2 m/s), *or* device not in `RUNNING`.
+1. Check battery — should be > 50% on clock screen
+2. Mount watch on wrist, harness pocket, or riser
+3. Verify vibro is felt. If buzzer is connected — verify sound.
+4. Check Settings (DOWN in CLOCK): Buzzer and Vibro should be [ON]
 
-Thus, pilots can primarily rely on haptics: light taps for weak thermals, longer bursts for stronger lift, and sustained vibration for dangerous sink.
+### Launch
+
+**Manual (recommended):**
+1. Wake device if sleeping (any button)
+2. Press OK on clock screen
+3. "Calibrating..." appears — **keep still for 2 seconds**
+4. Flight mode starts automatically
+
+**Automatic:**
+1. Device in CLOCK mode (showing time)
+2. When you launch, device detects altitude gain on its next check (1-60s delay)
+3. Screen shows "FLIGHT! Press DOWN"
+4. Press DOWN or OK → calibration (2s) → flight
+
+### In Flight
+
+**Buzzer (if connected):**
+- Fast high-pitch beeping → you're in a thermal (good)
+- Slow low-pitch beeping → you're sinking
+- Continuous low tone → emergency sink (> 3 m/s down)
+- Silence — speed below 0.75 m/s
+
+**Vibration motor:**
+- 1 pulse — weak lift (0.15-0.4 m/s)
+- 2 pulses — moderate lift (0.4-1.0 m/s)
+- 3 pulses — strong lift (1.0-2.0 m/s)
+- Frequent pulses — very strong lift (> 2.0 m/s)
+- Continuous vibration — hard sink (> 5 m/s down)
+- No vibration — silent zone or very weak movement
+
+**Screen** (updates 1x/sec): flight time, altitude, vario, max/min records
+
+### Landing
+
+**Manual:**
+1. Press OK — flight stops (timer freezes)
+2. Review flight statistics
+3. Press UP — return to CLOCK
+
+**Automatic:**
+1. After landing, device detects Vz < 0.75 m/s + no motion
+2. After 5 minutes — auto-stops flight, returns to CLOCK
+
+### After Flight
+
+- If left untouched for 5 minutes in CLOCK → goes to DEEP SLEEP
+- To force sleep: press UP in CLOCK
+- Charge via USB
 
 ---
 
-#### 3.5. Flight Termination and Shutdown
+## 7. Power Consumption
 
-1. **End of flight**: Press **RIGHT** → `RUNNING` → `STOPPED`:  
-   - Timer freezes,  
-   - Haptics disabled,  
-   - Final statistics retained on screen.
+| Mode | Current | Runtime |
+|------|---------|---------|
+| DEEP SLEEP | 5 µA | Months |
+| CLOCK (average) | 30 µA | Weeks |
+| RUNNING (flight) | 7 mA | 10+ hours on 200 mAh |
+| RUNNING + buzzer | ~10 mA | 8+ hours |
 
-2. **Power off**: Press **BACK** → device shows clock screen briefly, then enters `SLEEP`.  
-   - Alternatively, remain idle in `IDLE` for ~60 s → automatic deep sleep.
-
-Next power‑on (press **BACK**) returns to clock mode, ready for a new calibration and flight.
+Battery: 200 mAh LiPo (3.7V).
+Charge indicator: 4.2V = 100%, 3.3V = 0%.
 
 ---
 
-#### 3.6. Critical Notes
+## 8. Troubleshooting
 
-- **Calibration must be static**. Motion during “Calibrating…” corrupts `gMagRef`, leading to biased variometer.
-- **Barometric offset**: `Sea, m` uses fixed QNH = 1012.5 hPa; absolute altitude may be offset, but relative and vertical speed remain correct.
-- **Vibrator–accelerometer interference**: The firmware intentionally disables accelerometer during vibration to preserve measurement integrity.
-- **Sensitivity tuning**: `SENS_BARO_NOISE` and `SENS_ACCEL_TRUST` require firmware recompilation; pilots cannot adjust them on‑device.
+**Q: Screen is blank, nothing happens.**
+A: Press any button (UP/OK/DOWN) to wake. If no response — connect USB.
 
---- 
+**Q: Device doesn't respond to buttons.**
+A: Locked up. Connect USB — it will reboot.
 
+**Q: Variometer shows nonsense.**
+A: Recalibrate:
+1. Press UP → CLOCK
+2. Press OK → "Calibrating..."
+3. Keep still for 2 seconds
+4. Fly again
+
+**Q: No buzzer sound.**
+A: Check buzzer wiring (GPIO 32 + GND). May need a transistor if >50 mA.
+Check Settings: DOWN on clock → Buzzer: [ON].
+
+**Q: Auto-launch doesn't work.**
+A: Up to 60s delay between checks. Press OK manually to start.
+
+**Q: SENSOR FAIL on screen.**
+A: BMP390 barometer failure. Check wiring/solder joints. If error clears on next wake — temporary I2C glitch.
+
+**Q: SELF-TEST shows LOW BATT.**
+A: Battery below 3.4V. Charge via USB.
+
+**Q: Battery drains quickly.**
+A: Flight: 7-10 mA is normal. On ground, device should sleep at ~5 µA. If not — press UP for forced sleep.
+
+---
+
+## 9. Credits
+
+Original project: [github.com/isemaster/VibroVario](https://github.com/isemaster/VibroVario)  
+Developed by: isemaster  
+License: MIT — use, modify, sell. Keep attribution.
+
+---
+
+*Fly safe!*
