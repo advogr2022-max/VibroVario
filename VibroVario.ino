@@ -33,8 +33,7 @@ constexpr float CFG_TAU_COMPLEMENTARY   = 3.0f;   // Complementary filter time c
 constexpr float CFG_TAU_GRAVITY_VEC     = 2.0f;   // Gravity vector LPF time constant (s)
                                          // Determines "down" regardless of watch orientation
 
-// --- SYSTEM CONFIG ---
-constexpr float SEALEVELPRESSURE_HPA = 1013.25f;  // MSL pressure for altitude calculation
+ // --- SYSTEM CONFIG ---
 constexpr unsigned long REFRESH_MS = 1000;         // Display refresh period (ms)
 constexpr int LOOP_HZ = 50;                        // Main processing loop frequency (Hz)
 constexpr float SINK_TRH = -5.0f;                  // Hard sink alarm threshold (m/s)
@@ -104,6 +103,7 @@ RTC_DATA_ATTR float altCheck = 0.0f;                     // Last altitude for au
 RTC_DATA_ATTR unsigned long motionTime = 0;              // Motion wake counter (RTC)
 RTC_DATA_ATTR bool buzzerEnabled = true;                 // Buzzer enabled (RTC)
 RTC_DATA_ATTR bool vibroEnabled = true;                  // Vibro enabled (RTC)
+RTC_DATA_ATTR float userQNH = 1013.25f;                  // User-set QNH (RTC)
 
 // Variometer task state machine — replaces all static locals
 struct VarioFsm {
@@ -133,6 +133,8 @@ struct VarioFsm {
 struct FsmRuntime {
     FsmState state;
     bool lastBtn[3];
+    int settingsRow;       // 0-3: buzzer, vibro, time, qnh
+    int editPhase;         // 0=idle, 1=editing hours/high byte, 2=editing minutes/low byte
 } fsm;
 
 VarioFsm vfsm;
@@ -442,7 +444,7 @@ void varioTask(void *p) {
             if (bmp.performReading()) {
                 vfsm.bmpFailCount = 0;
                 portENTER_CRITICAL(&mux); data.bmpFail = false; portEXIT_CRITICAL(&mux);
-                float baro_alt = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+                float baro_alt = bmp.readAltitude(userQNH);
                 float v = varioEMA.update(ax, ay, az, acc_lin_ms2, baro_alt, dt);
 
                 portENTER_CRITICAL(&mux);
@@ -659,19 +661,55 @@ void drawSettings() {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        drawItem(-1, 20, &FreeSansBold18pt7b, "Settings");
+        drawItem(-1, 12, &FreeSansBold18pt7b, "Settings");
 
         display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(10, 60);
+        char buf[32];
+
+        // Row 0: Buzzer
+        display.setCursor(10, 50);
+        display.print(fsm.settingsRow == 0 ? ">" : " ");
         display.print("Buzzer: ");
-        display.print(buzzerEnabled ? "[ON]" : "[OFF]");
+        display.println(buzzerEnabled ? "[ON]" : "[OFF]");
 
-        display.setCursor(10, 90);
-        display.print("Vibro: ");
-        display.print(vibroEnabled ? "[ON]" : "[OFF]");
+        // Row 1: Vibro
+        display.setCursor(10, 75);
+        display.print(fsm.settingsRow == 1 ? ">" : " ");
+        display.print("Vibro:  ");
+        display.println(vibroEnabled ? "[ON]" : "[OFF]");
 
-        drawItem(-1, 150, &FreeSansBold9pt7b, "OK-toggle  UP-exit");
+        // Row 2: Time
+        display.setCursor(10, 100);
+        display.print(fsm.settingsRow == 2 ? ">" : " ");
+        display.print("Time:   ");
+        if (fsm.editPhase == 1) sprintf(buf, "%02d>%02d", rtc_h, rtc_m);
+        else if (fsm.editPhase == 2) sprintf(buf, "%02d:%02d<", rtc_h, rtc_m);
+        else sprintf(buf, "%02d:%02d", rtc_h, rtc_m);
+        display.println(buf);
+
+        // Row 3: QNH
+        display.setCursor(10, 125);
+        display.print(fsm.settingsRow == 3 ? ">" : " ");
+        display.print("QNH:    ");
+        if (fsm.editPhase >= 1) sprintf(buf, "%.1f_", userQNH);
+        else sprintf(buf, "%.1f", userQNH);
+        display.println(buf);
+
+        drawItem(-1, 170, &FreeSansBold9pt7b,
+            fsm.editPhase > 0 ? "UP/DOWN-adj  OK-save" : "UP-exit  DOWN-next  OK-act");
     } while (display.nextPage());
+}
+
+// Write hours+minutes to PCF8563 RTC in BCD format, seconds zeroed
+void writeTimeToRTC(int h, int m) {
+    uint8_t bcdH = ((h / 10) << 4) | (h % 10);
+    uint8_t bcdM = ((m / 10) << 4) | (m % 10);
+    Wire.beginTransmission(ADDR_RTC);
+    Wire.write(0x02); // seconds register
+    Wire.write(0x00); // seconds = 0
+    Wire.write(bcdM); // minutes
+    Wire.write(bcdH); // hours
+    Wire.endTransmission();
 }
 
 void startFlight() {
@@ -684,7 +722,7 @@ void startFlight() {
 
     if(data.sensInit) {
         if (bmp.performReading()) {
-            varioEMA.init(bmp.readAltitude(SEALEVELPRESSURE_HPA));
+            varioEMA.init(bmp.readAltitude(userQNH));
         }
         float sumMag = 0.0f;
         const int samples = 100;
@@ -702,7 +740,7 @@ void startFlight() {
                 sumMag += sqrtf(_ax*_ax + _ay*_ay + _az*_az);
             }
             if(bmp.performReading()) {
-                float rawAlt = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+                float rawAlt = bmp.readAltitude(userQNH);
                 varioEMA.update(_ax, _ay, _az, 0.0f, rawAlt, 0.02f);
             }
             delay(10);
@@ -838,6 +876,7 @@ void setup() {
 
     // Restore runtime FSM state from RTC
     fsm.state = fsmStateRTC;
+    fsm.settingsRow = 0; fsm.editPhase = 0;
 
     // Determine wake cause
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
@@ -900,7 +939,7 @@ void setup() {
                     bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
                     bmp.setOutputDataRate(BMP3_ODR_50_HZ);
                     if (bmp.performReading()) {
-                        float altNow = bmp.readAltitude(SEALEVELPRESSURE_HPA);
+                        float altNow = bmp.readAltitude(userQNH);
                         float vz = (altNow - altCheck) / 60.0f;
                         altCheck = altNow;
                         if (vz > FLIGHT_DETECT_VZ) {
@@ -971,6 +1010,7 @@ void loop() {
         // DOWN → settings
         if (press[0]) {
             fsm.state = FSM_SETTINGS;
+            fsm.settingsRow = 0; fsm.editPhase = 0;
             drawSettings();
             return;
         }
@@ -1015,29 +1055,59 @@ void loop() {
         break;
     }
 
-    case FSM_SETTINGS:
-        if (press[1]) { // OK — toggle
-            if (!buzzerEnabled || !vibroEnabled) {
-                if (!buzzerEnabled) buzzerEnabled = true;
-                else if (!vibroEnabled) vibroEnabled = true;
-            } else {
-                buzzerEnabled = false;
+    case FSM_SETTINGS: {
+        // Edit mode (time or QNH adjustment active)
+        if (fsm.editPhase > 0) {
+            if (press[2]) { // UP → increase
+                if (fsm.settingsRow == 2) {
+                    if (fsm.editPhase == 1) rtc_h = (rtc_h + 1) % 24;
+                    else rtc_m = (rtc_m + 1) % 60;
+                } else if (fsm.settingsRow == 3) {
+                    userQNH += 0.1f;
+                    if (userQNH > 1050.0f) userQNH = 1050.0f;
+                }
+                drawSettings(); return;
             }
-            drawSettings();
-            return;
+            if (press[0]) { // DOWN → decrease
+                if (fsm.settingsRow == 2) {
+                    if (fsm.editPhase == 1) rtc_h = (rtc_h + 23) % 24;
+                    else rtc_m = (rtc_m + 59) % 60;
+                } else if (fsm.settingsRow == 3) {
+                    userQNH -= 0.1f;
+                    if (userQNH < 950.0f) userQNH = 950.0f;
+                }
+                drawSettings(); return;
+            }
+            if (press[1]) { // OK → save and advance/exit
+                if (fsm.settingsRow == 2) {
+                    if (fsm.editPhase == 1) fsm.editPhase = 2;
+                    else { writeTimeToRTC(rtc_h, rtc_m); fsm.editPhase = 0; }
+                } else { fsm.editPhase = 0; }
+                drawSettings(); return;
+            }
+            delay(50); break;
         }
-        if (press[0]) { // DOWN — reset all to ON
-            buzzerEnabled = true; vibroEnabled = true;
-            drawSettings();
-            return;
+
+        // Normal settings navigation
+        if (press[1]) { // OK on current row
+            if (fsm.settingsRow == 0) { buzzerEnabled = !buzzerEnabled; drawSettings(); return; }
+            if (fsm.settingsRow == 1) { vibroEnabled = !vibroEnabled; drawSettings(); return; }
+            if (fsm.settingsRow == 2) { fsm.editPhase = 1; drawSettings(); return; }
+            if (fsm.settingsRow == 3) { fsm.editPhase = 1; drawSettings(); return; }
         }
-        if (press[2]) { // UP — exit to clock
+        if (press[0]) { // DOWN → next row
+            fsm.settingsRow = (fsm.settingsRow + 1) % 4;
+            drawSettings(); return;
+        }
+        if (press[2]) { // UP → exit to clock
             readRTC(); drawClock(true);
             fsm.state = FSM_CLOCK;
+            fsm.editPhase = 0;
             return;
         }
         delay(50);
         break;
+    }
 
     case FSM_CALIBRATING:
         // startFlight() handled calibration and set RUNNING.
