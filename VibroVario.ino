@@ -99,7 +99,7 @@ constexpr int ACC_INT_1_PIN = 14;                    // BMA423 INT1 (any-motion 
 constexpr int RTC_INT_PIN = 27;                      // PCF8563 INT (alarm wake)
 
 // --- GLOBAL STATE ---
-enum FsmState { FSM_CLOCK, FSM_SETTINGS, FSM_CALIBRATING, FSM_RUNNING, FSM_STOPPED };
+enum FsmState { FSM_CLOCK, FSM_SETTINGS, FSM_CALIBRATING, FSM_RUNNING, FSM_STOPPED, FSM_WEB_EXPORT };
 RTC_DATA_ATTR FsmState fsmStateRTC = FSM_CLOCK;          // FSM state across deep sleep
 RTC_DATA_ATTR unsigned long stopwatchElapsed = 0;        // Accumulated flight time
 RTC_DATA_ATTR int lastWakeMinute = -1;                   // Last wake minute (for 1/min check)
@@ -122,12 +122,14 @@ RTC_DATA_ATTR int userAltM = 0;                     // User field elevation in m
 // The partition is never formatted as SPIFFS — we use esp_partition
 // directly for raw sequential writes with ring-buffer wrap.
 RTC_DATA_ATTR struct {
-    uint32_t magic;             // 0x54524B52 ("TRKR") — validity marker
+    uint32_t magic;             // 0x54524B53 ("TRK2") — validity marker
     uint16_t flightNum;         // current flight number, auto-increments
     uint32_t writeOffset;       // next write byte offset in partition
     uint16_t lastEraseSector;   // last 4KB sector erased (prevents double-erase)
     uint32_t totalRecords;      // total records written since first boot
-} trackState = {0, 0, 0, 0, 0};
+    uint8_t flightStartDay;     // DD of current flight (for CSV export)
+    uint8_t flightStartMon;     // MM of current flight (for CSV export)
+} trackState = {0, 0, 0, 0, 0, 0, 0};
 
 // Packed binary record format
 struct __attribute__((packed)) TrackRecord {
@@ -713,19 +715,19 @@ void drawSettings() {
         char buf[32];
 
         // Row 0: Buzzer
-        display.setCursor(10, 50);
+        display.setCursor(10, 48);
         display.print(fsm.settingsRow == 0 ? ">" : " ");
         display.print("Buzzer: ");
         display.println(buzzerEnabled ? "[ON]" : "[OFF]");
 
         // Row 1: Vibro
-        display.setCursor(10, 75);
+        display.setCursor(10, 68);
         display.print(fsm.settingsRow == 1 ? ">" : " ");
         display.print("Vibro:  ");
         display.println(vibroEnabled ? "[ON]" : "[OFF]");
 
         // Row 2: Time
-        display.setCursor(10, 100);
+        display.setCursor(10, 88);
         display.print(fsm.settingsRow == 2 ? ">" : " ");
         display.print("Time:   ");
         if (fsm.editPhase == 1) sprintf(buf, "%02d>%02d", rtc_h, rtc_m);
@@ -734,14 +736,20 @@ void drawSettings() {
         display.println(buf);
 
         // Row 3: Alt (elevation → auto QNH)
-        display.setCursor(10, 125);
+        display.setCursor(10, 108);
         display.print(fsm.settingsRow == 3 ? ">" : " ");
         display.print("Alt:    ");
         if (fsm.editPhase >= 1) sprintf(buf, "%dm_", userAltM);
         else sprintf(buf, "%dm", userAltM);
         display.println(buf);
 
-        drawItem(-1, 170, &FreeSansBold9pt7b,
+        // Row 4: WiFi export
+        display.setCursor(10, 130);
+        display.print(fsm.settingsRow == 4 ? ">" : " ");
+        display.print("WiFi:   ");
+        display.println("[OFF]");
+
+        drawItem(-1, 175, &FreeSansBold9pt7b,
             fsm.editPhase > 0 ? "UP/DOWN-adj  OK-save" : "UP-exit  DOWN-next  OK-act");
     } while (display.nextPage());
 }
@@ -843,6 +851,8 @@ void startFlight() {
         // Init flight tracker for this flight
         trackState.flightNum++;
         readRTC();
+        trackState.flightStartDay = (uint8_t)rtc_d;
+        trackState.flightStartMon = (uint8_t)rtc_mon;
         vfsm.flightStartSec = (unsigned long)rtc_h * 3600UL + (unsigned long)rtc_m * 60UL + (unsigned long)rtc_s;
         vfsm.lastLogSec = 0;
         fsm.state = FSM_RUNNING;
@@ -930,14 +940,16 @@ void initTracker() {
                                           ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
     if (!trackPart) return;  // no partition — tracking disabled
 
-    if (trackState.magic != 0x54524B52) {
+    if (trackState.magic != 0x54524B53) {
         // First boot — erase entire partition
         esp_partition_erase_range(trackPart, 0, trackPart->size);
-        trackState.magic = 0x54524B52;
+        trackState.magic = 0x54524B53;
         trackState.flightNum = 0;
         trackState.writeOffset = 0;
         trackState.lastEraseSector = 0;
         trackState.totalRecords = 0;
+        trackState.flightStartDay = 0;
+        trackState.flightStartMon = 0;
     }
 }
 
@@ -974,6 +986,193 @@ void logRecord() {
     esp_partition_write(trackPart, trackState.writeOffset, &rec, sizeof(rec));
     trackState.writeOffset += sizeof(rec);
     trackState.totalRecords++;
+}
+
+// --- WEB EXPORT ---
+WiFiServer webServer(80);
+unsigned long webExportStartTime = 0;
+bool webExportActive = false;
+
+void drawWebExport() {
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setTextColor(GxEPD_BLACK);
+        drawItem(-1, 15, &FreeSansBold18pt7b, "WiFi Export");
+        drawItem(-1, 40, &FreeSansBold9pt7b, "SSID: VibroVario");
+        drawItem(-1, 60, &FreeSansBold9pt7b, "IP: 192.168.4.1");
+        char buf[32];
+        int remain = (15*60 - (int)((millis() - webExportStartTime)/1000));
+        if (remain < 0) remain = 0;
+        sprintf(buf, "Active: %02d:%02d", remain/60, remain%60);
+        drawItem(-1, 80, &FreeSansBold9pt7b, buf);
+        drawItem(-1, 105, &FreeSansBold9pt7b, "Open browser to IP");
+        drawItem(-1, 125, &FreeSansBold9pt7b, "/export  - all flights");
+        drawItem(-1, 145, &FreeSansBold9pt7b, "/export?f=1 - flight 1");
+        drawItem(-1, 175, &FreeSansBold9pt7b, "UP - exit");
+    } while (display.nextPage());
+}
+
+void startWebExport() {
+    // Turn on WiFi in AP mode
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("VibroVario");
+    webServer.begin();
+    webExportStartTime = millis();
+    webExportActive = true;
+    drawWebExport();
+}
+
+// Format seconds-since-midnight as HH:MM:SS
+static void fmtTime(char* buf, uint32_t sec) {
+    uint8_t h = sec / 3600;
+    uint8_t m = (sec % 3600) / 60;
+    uint8_t s = sec % 60;
+    sprintf(buf, "%02d:%02d:%02d", h, m, s);
+}
+
+// Read all records from the ring buffer and send as CSV.
+// Flights are separated by flightNum changes.
+// If flightFilter > 0, only that flight number is exported.
+void exportCSV(WiFiClient &client, int flightFilter) {
+    if (!trackPart || trackState.totalRecords == 0) {
+        client.println("No track data");
+        return;
+    }
+
+    // Determine read ranges (ring buffer order: oldest first)
+    size_t partSz = trackPart->size;
+    size_t recSz = sizeof(TrackRecord);
+    size_t numSlots = partSz / recSz;
+
+    size_t r1_off = 0, r1_len = 0;
+    size_t r2_off = 0, r2_len = 0;
+
+    if (trackState.totalRecords <= numSlots) {
+        // No wrap: data is [0, writeOffset)
+        r1_off = 0;
+        r1_len = trackState.writeOffset;
+    } else {
+        // Wrapped: oldest at writeOffset to end, then 0 to writeOffset
+        r1_off = trackState.writeOffset;
+        r1_len = partSz - trackState.writeOffset;
+        r2_off = 0;
+        r2_len = trackState.writeOffset;
+    }
+
+    // CSV header
+    client.println("FLT;DATE;TIME;ALT_M");
+
+    uint16_t curFlight = 0xFFFF;
+    int day = 0, mon = 0;
+
+    // Read helper
+    auto readAndSend = [&](size_t offset, size_t length) -> bool {
+        size_t count = length / recSz;
+        for (size_t i = 0; i < count; i++) {
+            TrackRecord rec;
+            esp_partition_read(trackPart, offset + i * recSz, &rec, recSz);
+
+            // Filter by flight
+            if (flightFilter > 0 && rec.flightNum != (uint16_t)flightFilter)
+                continue;
+            if (rec.flightNum == 0) // uninitialized
+                continue;
+
+            // Detect flight boundary
+            if (rec.flightNum != curFlight) {
+                curFlight = rec.flightNum;
+                // Use stored date from the flight start
+                day = trackState.flightStartDay;
+                mon = trackState.flightStartMon;
+                // Fallback: if date is 0, use current RTC date
+                if (day == 0 || mon == 0) { day = rtc_d; mon = rtc_mon; }
+            }
+
+            char timeStr[9];
+            fmtTime(timeStr, rec.secSinceMidnight);
+
+            char buf[64];
+            sprintf(buf, "%d;%02d.%02d;%s;%d", rec.flightNum, day, mon, timeStr, rec.altM);
+            client.println(buf);
+
+            if (!client) return false;  // disconnected
+        }
+        return true;
+    };
+
+    if (r1_len > 0) { if (!readAndSend(r1_off, r1_len)) return; }
+    if (r2_len > 0) { readAndSend(r2_off, r2_len); }
+}
+
+void handleWebClient() {
+    WiFiClient client = webServer.available();
+    if (!client) return;
+
+    // Read the first line of the HTTP request
+    String request = client.readStringUntil('\n');
+    request.trim();
+    client.readStringUntil('\n');  // consume headers (all remaining)
+
+    // Parse path: GET /export or GET /export?f=N or GET /
+    int flightFilter = -1;
+    bool isExport = false;
+
+    if (request.indexOf("GET /export") == 0) {
+        isExport = true;
+        // Check for ?f=N parameter
+        int fPos = request.indexOf("?f=");
+        if (fPos > 0) {
+            flightFilter = request.substring(fPos + 3).toInt();
+        }
+    } else if (request.indexOf("GET / ") == 0) {
+        isExport = false;
+    } else {
+        // Unknown path, 404
+        client.println("HTTP/1.1 404 Not Found");
+        client.println("Connection: close");
+        client.println();
+        client.stop();
+        return;
+    }
+
+    if (isExport) {
+        // Send CSV
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: text/csv; charset=utf-8");
+        client.println("Content-Disposition: attachment; filename=vibrovario.csv");
+        client.println("Connection: close");
+        client.println();
+        exportCSV(client, flightFilter);
+    } else {
+        // Landing page
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: text/html; charset=utf-8");
+        client.println("Connection: close");
+        client.println();
+        client.println("<!DOCTYPE html><html><body>");
+        client.println("<h2>VibroVario Export</h2>");
+        client.println("<p><a href=\"/export\">Download all flights (CSV)</a></p>");
+        char buf[128];
+        int remain = (15*60 - (int)((millis() - webExportStartTime)/1000));
+        if (remain < 0) remain = 0;
+        sprintf(buf, "<p>Active: %02d:%02d</p>", remain/60, remain%60);
+        client.println(buf);
+        // List individual flights from track data
+        if (trackPart && trackState.totalRecords > 0) {
+            client.println("<ul>");
+            int maxF = trackState.flightNum;
+            for (int f = 1; f <= maxF; f++) {
+                sprintf(buf, "<li><a href=\"/export?f=%d\">Flight %d</a></li>", f, f);
+                client.println(buf);
+            }
+            client.println("</ul>");
+        }
+        client.println("</body></html>");
+    }
+
+    client.stop();
 }
 
 void goDeepSleep() {
@@ -1251,9 +1450,14 @@ void loop() {
             if (fsm.settingsRow == 1) { vibroEnabled = !vibroEnabled; drawSettings(); return; }
             if (fsm.settingsRow == 2) { fsm.editPhase = 1; drawSettings(); return; }
             if (fsm.settingsRow == 3) { fsm.editPhase = 1; drawSettings(); return; }
+            if (fsm.settingsRow == 4) {
+                // Start WiFi web export mode
+                fsm.state = FSM_WEB_EXPORT;
+                return;
+            }
         }
         if (press[0]) { // DOWN → next row
-            fsm.settingsRow = (fsm.settingsRow + 1) % 4;
+            fsm.settingsRow = (fsm.settingsRow + 1) % 5;
             drawSettings(); return;
         }
         if (press[2]) { // UP → exit to clock
@@ -1370,5 +1574,29 @@ void loop() {
         }
         delay(10);
         break;
+
+    case FSM_WEB_EXPORT: {
+        handleWebClient();
+        // Check 15-minute timeout
+        if (webExportActive && (millis() - webExportStartTime > 15*60*1000UL)) {
+            webExportActive = false;
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_OFF);
+            readRTC(); drawClock(true);
+            fsm.state = FSM_CLOCK;
+            return;
+        }
+        // UP → exit early
+        if (press[2]) {
+            webExportActive = false;
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_OFF);
+            readRTC(); drawClock(true);
+            fsm.state = FSM_CLOCK;
+            return;
+        }
+        delay(10);
+        break;
+    }
     }
 }
