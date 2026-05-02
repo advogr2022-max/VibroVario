@@ -520,6 +520,13 @@ void drawClock(bool fullInit) {
         drawItem(-1, 110, &FreeSansBold24pt7b, buf);
         sprintf(buf, "%02d.%02d", rtc_d, rtc_mon);
         drawItem(-1, 160, &FreeSansBold18pt7b, buf);
+
+        // Button labels in corners (tiny 9pt)
+        display.setFont(&FreeSansBold9pt7b);
+        display.setCursor(2, 10);   display.print("1");  // OK (GPIO26)
+        display.setCursor(188, 10); display.print("2");  // UP (GPIO25)
+        display.setCursor(2, 196);  display.print("3");  // EDIT (GPIO4)
+        display.setCursor(188, 196);display.print("4");  // DOWN (GPIO35)
     } while (display.nextPage());
 }
 
