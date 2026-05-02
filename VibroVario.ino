@@ -109,6 +109,7 @@ RTC_DATA_ATTR bool buzzerEnabled = true;                 // Buzzer enabled (RTC)
 RTC_DATA_ATTR bool vibroEnabled = true;                  // Vibro enabled (RTC)
 RTC_DATA_ATTR float userQNH = 1013.25f;             // User-set QNH (RTC)
 RTC_DATA_ATTR int userAltM = 0;                     // User field elevation in meters (RTC)
+RTC_DATA_ATTR int varioSensitivity = 4;             // 0=fastest..9=smoothest, default 4
 
 // --- FLIGHT TRACKER ---
 // Ring buffer on the SPIFFS flash partition. Each record is 8 bytes.
@@ -122,7 +123,7 @@ RTC_DATA_ATTR int userAltM = 0;                     // User field elevation in m
 // The partition is never formatted as SPIFFS — we use esp_partition
 // directly for raw sequential writes with ring-buffer wrap.
 RTC_DATA_ATTR struct {
-    uint32_t magic;             // 0x54524B53 ("TRK2") — validity marker
+    uint32_t magic;             // 0x54524B54 ("TRK3") — validity marker
     uint16_t flightNum;         // current flight number, auto-increments
     uint32_t writeOffset;       // next write byte offset in partition
     uint16_t lastEraseSector;   // last 4KB sector erased (prevents double-erase)
@@ -131,11 +132,13 @@ RTC_DATA_ATTR struct {
     uint8_t flightStartMon;     // MM of current flight (for CSV export)
 } trackState = {0, 0, 0, 0, 0, 0, 0};
 
-// Packed binary record format
+// Packed binary record format (10 bytes):
+// flightNum(2) | date(2: day<<8|mon) | secSinceMidnight(4) | altM(2)
 struct __attribute__((packed)) TrackRecord {
     uint16_t flightNum;
-    uint32_t secSinceMidnight;  // 0-86399 seconds since 00:00
-    int16_t altM;               // altitude in meters MSL
+    uint16_t date;              // (day << 8) | mon  — stored per record for correct CSV dates
+    uint32_t secSinceMidnight;
+    int16_t altM;
 };
 
 // Flight metadata for web export table
@@ -144,6 +147,8 @@ struct FlightInfo {
     uint16_t recCount;
     uint32_t startSec;
     uint32_t endSec;
+    uint8_t day;
+    uint8_t mon;
 };
 
 // Variometer task state machine — replaces all static locals
@@ -176,8 +181,8 @@ struct VarioFsm {
 struct FsmRuntime {
     FsmState state;
     bool lastBtn[3];
-    int settingsRow;       // 0-3: buzzer, vibro, time, qnh
-    int editPhase;         // 0=idle, 1=editing hours/high byte, 2=editing minutes/low byte
+    int settingsRow;       // 0-5: buzzer, vibro, time, alt, wifi, sensitivity
+    int editPhase;         // 0=idle, 1=editing hours/high byte, 2=editing minutes/low byte, 3=editing sensitivity
 } fsm;
 
 VarioFsm vfsm;
@@ -214,6 +219,8 @@ class VarioEMA {
   float velInertialLP_  = 0.0f;   // Low-pass for drift removal
   float varioBaroLP_    = 0.0f;   // Low-pass baro vario
 
+  float tauComp_        = 3.0f;   // Complementary filter time constant (runtime-adjustable)
+
   // Gravity vector estimation (LPF on raw accel)
   float gxEst_ = 0.0f, gyEst_ = 0.0f, gzEst_ = 0.0f;  // Low-frequency gravity estimate (G)
 
@@ -237,8 +244,11 @@ public:
       velInertialLP_ = 0.0f;
       varioBaroLP_   = 0.0f;
       gxEst_ = 0.0f; gyEst_ = 0.0f; gzEst_ = 0.0f;
+      tauComp_       = 3.0f;  // reset to default
       inited_        = true;
   }
+
+  void setTauComp(float t) { if (t > 0.1f && t < 20.0f) tauComp_ = t; }
 
   // Main filter update method.
   // ax_raw, ay_raw, az_raw — raw accelerometer readings (units: G, ±8g range)
@@ -304,7 +314,7 @@ public:
       // 8. Complementary filter: IMU + Baro
       velInertial_ += azMs2 * dt;                    // Integrate vertical acceleration
 
-      float aComp = alphaFromTau(dt, CFG_TAU_COMPLEMENTARY);
+      float aComp = alphaFromTau(dt, tauComp_);
       velInertialLP_ += aComp * (velInertial_ - velInertialLP_);  // Drift estimation
 
       float velInertialHP = velInertial_ - velInertialLP_;        // HP = drift-free
@@ -332,12 +342,19 @@ VarioEMA varioEMA;
 // Read altitude using user-set QNH. Wraps BMP library call.
 float readAlt() { return bmp.readAltitude(userQNH); }
 
+// Map sensitivity 0-9 to complementary filter tau (0.5s..8.0s)
+float sensToTau(int sens) {
+    if (sens < 0) sens = 0;
+    if (sens > 9) sens = 9;
+    return 0.5f + (float)sens * 0.8333f;  // sens 4 → ~3.83s (close to default 3.0)
+}
+
 // --- HELPER FUNCTIONS ---
 void i2cWrite(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
   Wire.write(val);
-  Wire.endTransmission();
+  Wire.endTransmission();  // return intentionally ignored — non-critical (BMA motion wake, RTC alarm)
 }
 
 uint8_t bcd2dec(uint8_t v) { return ((v/16*10) + (v%16)); }
@@ -757,6 +774,14 @@ void drawSettings() {
         display.print("WiFi:   ");
         display.println("[OFF]");
 
+        // Row 5: Sensitivity
+        display.setCursor(10, 150);
+        display.print(fsm.settingsRow == 5 ? ">" : " ");
+        display.print("Sens:   ");
+        if (fsm.editPhase == 3) sprintf(buf, "[%d*]", varioSensitivity);
+        else sprintf(buf, "[%d]", varioSensitivity);
+        display.println(buf);
+
         drawItem(-1, 175, &FreeSansBold9pt7b,
             fsm.editPhase > 0 ? "UP/DOWN-adj  OK-save" : "UP-exit  DOWN-next  OK-act");
     } while (display.nextPage());
@@ -856,6 +881,8 @@ void startFlight() {
         data.tStart = millis();
         if(!vTaskH) xTaskCreatePinnedToCore(varioTask, "V", 4096, NULL, 10, &vTaskH, 0);
         vfsm.reset();
+        // Apply sensitivity setting
+        varioEMA.setTauComp(sensToTau(varioSensitivity));
         // Init flight tracker for this flight
         trackState.flightNum++;
         readRTC();
@@ -948,10 +975,10 @@ void initTracker() {
                                           ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
     if (!trackPart) return;  // no partition — tracking disabled
 
-    if (trackState.magic != 0x54524B53) {
+    if (trackState.magic != 0x54524B54) {
         // First boot — erase entire partition
         esp_partition_erase_range(trackPart, 0, trackPart->size);
-        trackState.magic = 0x54524B53;
+        trackState.magic = 0x54524B54;
         trackState.flightNum = 0;
         trackState.writeOffset = 0;
         trackState.lastEraseSector = 0;
@@ -969,6 +996,7 @@ void logRecord() {
     TrackRecord rec;
     rec.flightNum = trackState.flightNum;
     rec.altM = (int16_t)roundf(data.alt);
+    rec.date = ((uint16_t)trackState.flightStartDay << 8) | trackState.flightStartMon;
     // Compute seconds-since-midnight from flight start
     unsigned long elapsed = millis() / 1000;
     unsigned long secOfDay = (vfsm.flightStartSec + elapsed) % 86400UL;
@@ -1038,6 +1066,8 @@ int scanFlights(FlightInfo *flights, int maxFlights) {
                     cur->startSec = rec.secSinceMidnight;
                     cur->endSec = rec.secSinceMidnight;
                     cur->recCount = 1;
+                    cur->day = rec.date >> 8;
+                    cur->mon = rec.date & 0xFF;
                 }
             } else if (cur) {
                 cur->endSec = rec.secSinceMidnight;
@@ -1137,12 +1167,10 @@ void handleRoot(WiFiClient &c) {
     int nFlights = scanFlights(flist, 30);
     if (nFlights > 0) {
         c.println("<table><tr><th>Flight</th><th>Date</th><th>Start</th><th>Duration</th><th>Points</th><th></th></tr>");
-        // We need date for each flight. Use flightStartDay/Mon from most recent flight's date,
-        // or RTC date for fallback.
-        int day = trackState.flightStartDay ? trackState.flightStartDay : rtc_d;
-        int mon = trackState.flightStartMon ? trackState.flightStartMon : rtc_mon;
         for (int i = nFlights - 1; i >= 0; i--) {  // newest first
             FlightInfo &f = flist[i];
+            int day = f.day ? f.day : rtc_d;
+            int mon = f.mon ? f.mon : rtc_mon;
             char ts[9], dur[9];
             fmtTime(ts, f.startSec);
             fmtDuration(dur, f.startSec, f.endSec);
@@ -1193,7 +1221,6 @@ void handleExport(WiFiClient &c, int flightFilter) {
 
     c.println("FLT;DATE;TIME;ALT_M");
     uint16_t curFlight = 0xFFFF;
-    int day = 0, mon = 0;
 
     auto sendRange = [&](size_t off, size_t len) {
         size_t cnt = len / recSz;
@@ -1203,12 +1230,10 @@ void handleExport(WiFiClient &c, int flightFilter) {
             if (flightFilter > 0 && rec.flightNum != (uint16_t)flightFilter) continue;
             if (rec.flightNum == 0) continue;
 
-            if (rec.flightNum != curFlight) {
-                curFlight = rec.flightNum;
-                day = trackState.flightStartDay;
-                mon = trackState.flightStartMon;
-                if (day == 0 || mon == 0) { day = rtc_d; mon = rtc_mon; }
-            }
+            // Each record carries its own date
+            int day = rec.date >> 8;
+            int mon = rec.date & 0xFF;
+            if (day == 0 || mon == 0) { day = rtc_d; mon = rtc_mon; }
 
             char ts[9];
             fmtTime(ts, rec.secSinceMidnight);
@@ -1598,6 +1623,8 @@ void loop() {
                 } else if (fsm.settingsRow == 3) {
                     userAltM += 5;
                     if (userAltM > 5000) userAltM = 5000;
+                } else if (fsm.settingsRow == 5) {
+                    if (varioSensitivity < 9) varioSensitivity++;
                 }
                 drawSettings(); return;
             }
@@ -1608,6 +1635,8 @@ void loop() {
                 } else if (fsm.settingsRow == 3) {
                     userAltM -= 5;
                     if (userAltM < 0) userAltM = 0;
+                } else if (fsm.settingsRow == 5) {
+                    if (varioSensitivity > 0) varioSensitivity--;
                 }
                 drawSettings(); return;
             }
@@ -1615,9 +1644,11 @@ void loop() {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) fsm.editPhase = 2;
                     else { writeTimeToRTC(rtc_h, rtc_m); fsm.editPhase = 0; }
-                } else {
+                } else if (fsm.settingsRow == 3) {
                     computeQNHfromAlt(userAltM);
                     fsm.editPhase = 0;
+                } else {
+                    fsm.editPhase = 0;  // sensitivity: save on OK
                 }
                 drawSettings(); return;
             }
@@ -1635,9 +1666,10 @@ void loop() {
                 fsm.state = FSM_WEB_EXPORT;
                 return;
             }
+            if (fsm.settingsRow == 5) { fsm.editPhase = 3; drawSettings(); return; }
         }
         if (press[0]) { // DOWN → next row
-            fsm.settingsRow = (fsm.settingsRow + 1) % 5;
+            fsm.settingsRow = (fsm.settingsRow + 1) % 6;
             drawSettings(); return;
         }
         if (press[2]) { // UP → exit to clock
