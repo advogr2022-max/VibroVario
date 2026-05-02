@@ -76,11 +76,6 @@ constexpr int EPD_DC = 10;                         // E-Ink data/command
 constexpr int EPD_BUSY = 19;                       // E-Ink busy
 constexpr uint8_t ADDR_BMA = 0x18;                 // BMA423 I2C address
 constexpr uint8_t ADDR_RTC = 0x51;                 // PCF8563 RTC I2C address
-#ifndef ACC_INT_1_PIN
-constexpr int ACC_INT_1_PIN = 14;                  // BMA423 INT1 (any-motion wake)
-#endif
-#ifndef RTC_INT_PIN
-constexpr int RTC_INT_PIN = 27;                    // PCF8563 INT (alarm wake)
-#endif
+// ACC_INT_1_PIN (14) and RTC_INT_PIN (27) — defined in Watchy variant pins_arduino.h
 
 #endif // CONFIG_H
