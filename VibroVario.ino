@@ -11,6 +11,7 @@
 
 #include <esp_sleep.h>
 #include <esp_task_wdt.h>
+#include <esp_partition.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
@@ -109,6 +110,32 @@ RTC_DATA_ATTR bool vibroEnabled = true;                  // Vibro enabled (RTC)
 RTC_DATA_ATTR float userQNH = 1013.25f;             // User-set QNH (RTC)
 RTC_DATA_ATTR int userAltM = 0;                     // User field elevation in meters (RTC)
 
+// --- FLIGHT TRACKER ---
+// Ring buffer on the SPIFFS flash partition. Each record is 8 bytes.
+// At 1 record/sec, a 3h flight = 10,800 records = 86.4 KB.
+// 1.5 MB partition holds ~18 flights before wrap.
+// Track state survives deep sleep (RTC_DATA_ATTR).
+//
+// Record format (8 bytes):
+//   flightNum (uint16) | secSinceMidnight (uint32) | altitudeM (int16)
+//
+// The partition is never formatted as SPIFFS — we use esp_partition
+// directly for raw sequential writes with ring-buffer wrap.
+RTC_DATA_ATTR struct {
+    uint32_t magic;             // 0x54524B52 ("TRKR") — validity marker
+    uint16_t flightNum;         // current flight number, auto-increments
+    uint32_t writeOffset;       // next write byte offset in partition
+    uint16_t lastEraseSector;   // last 4KB sector erased (prevents double-erase)
+    uint32_t totalRecords;      // total records written since first boot
+} trackState = {0, 0, 0, 0, 0};
+
+// Packed binary record format
+struct __attribute__((packed)) TrackRecord {
+    uint16_t flightNum;
+    uint32_t secSinceMidnight;  // 0-86399 seconds since 00:00
+    int16_t altM;               // altitude in meters MSL
+};
+
 // Variometer task state machine — replaces all static locals
 struct VarioFsm {
     int pulses = 0;
@@ -124,12 +151,14 @@ struct VarioFsm {
     bool running = true;
     int bmpFailCount = 0;
     unsigned long lastActivity = 0;
+    unsigned long lastLogSec = 0;
+    unsigned long flightStartSec = 0;  // seconds-since-midnight at flight start
     void reset() {
         pulses = 0; pulseOn = false; nextT = 0; pause = false;
         vibroActive = false; vibroStopT = 0;
         bzOn = false; bzNextT = 0;
         lastUpdateMicros = micros();
-        vSmooth = 0.0f; lastActivity = 0; running = true; bmpFailCount = 0;
+        vSmooth = 0.0f; lastActivity = 0; lastLogSec = 0; flightStartSec = 0; running = true; bmpFailCount = 0;
     }
 };
 
@@ -151,7 +180,7 @@ struct SysData {
   unsigned long tStart, tScreen;
 } data;
 
-int rtc_h, rtc_m, rtc_d, rtc_mon;
+int rtc_s, rtc_h, rtc_m, rtc_d, rtc_mon;
 Adafruit_BMP3XX bmp;
 GxEPD2_BW<GxEPD2_154_D67, 200> display(GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RES, EPD_BUSY));
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -305,14 +334,15 @@ uint8_t bcd2dec(uint8_t v) { return ((v/16*10) + (v%16)); }
 
 void readRTC() {
   Wire.beginTransmission(ADDR_RTC); Wire.write(0x02); Wire.endTransmission();
-  Wire.requestFrom(ADDR_RTC, 6);
+  Wire.requestFrom(ADDR_RTC, 7);
   if(Wire.available()) {
-     Wire.read(); // skip seconds
-     rtc_m = bcd2dec(Wire.read()&0x7F);
-     rtc_h = bcd2dec(Wire.read()&0x3F);
-     rtc_d = bcd2dec(Wire.read()&0x3F);
-     Wire.read(); // skip
-     rtc_mon = bcd2dec(Wire.read()&0x1F);
+     rtc_s = bcd2dec(Wire.read() & 0x7F);
+     rtc_m = bcd2dec(Wire.read() & 0x7F);
+     rtc_h = bcd2dec(Wire.read() & 0x3F);
+     rtc_d = bcd2dec(Wire.read() & 0x3F);
+     Wire.read(); // skip weekday
+     rtc_mon = bcd2dec(Wire.read() & 0x1F);
+     Wire.read(); // skip year/century
   }
 }
 
@@ -581,6 +611,13 @@ void varioTask(void *p) {
                     portENTER_CRITICAL(&mux); data.bmpFail = true; portEXIT_CRITICAL(&mux);
                 }
             }
+
+            // Log track record: 1 Hz, only during active flight
+            unsigned long tickSec = millis() / 1000;
+            if (tickSec != vfsm.lastLogSec) {
+                vfsm.lastLogSec = tickSec;
+                logRecord();
+            }
         } else {
             digitalWrite(PIN_VIBRO, 0);
             ledcWrite(BUZZER_PIN, 0);
@@ -803,6 +840,11 @@ void startFlight() {
         data.tStart = millis();
         if(!vTaskH) xTaskCreatePinnedToCore(varioTask, "V", 4096, NULL, 10, &vTaskH, 0);
         vfsm.reset();
+        // Init flight tracker for this flight
+        trackState.flightNum++;
+        readRTC();
+        vfsm.flightStartSec = (unsigned long)rtc_h * 3600UL + (unsigned long)rtc_m * 60UL + (unsigned long)rtc_s;
+        vfsm.lastLogSec = 0;
         fsm.state = FSM_RUNNING;
         fsmStateRTC = FSM_RUNNING;
     }
@@ -878,6 +920,62 @@ void runSelfTest() {
     }
 }
 
+// --- FLIGHT TRACKER ---
+// Initialise the ring buffer on the SPIFFS flash partition.
+// On first boot (magic mismatch), erase the entire partition.
+const esp_partition_t* trackPart = NULL;
+
+void initTracker() {
+    trackPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                          ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+    if (!trackPart) return;  // no partition — tracking disabled
+
+    if (trackState.magic != 0x54524B52) {
+        // First boot — erase entire partition
+        esp_partition_erase_range(trackPart, 0, trackPart->size);
+        trackState.magic = 0x54524B52;
+        trackState.flightNum = 0;
+        trackState.writeOffset = 0;
+        trackState.lastEraseSector = 0;
+        trackState.totalRecords = 0;
+    }
+}
+
+// Write one track record to the ring buffer.
+// Called from varioTask() every ~1 second during flight.
+void logRecord() {
+    if (!trackPart) return;
+
+    TrackRecord rec;
+    rec.flightNum = trackState.flightNum;
+    rec.altM = (int16_t)roundf(data.alt);
+    // Compute seconds-since-midnight from flight start
+    unsigned long elapsed = millis() / 1000;
+    unsigned long secOfDay = (vfsm.flightStartSec + elapsed) % 86400UL;
+    rec.secSinceMidnight = (uint32_t)secOfDay;
+
+    // Ring buffer: wrap to 0 if not enough space
+    if (trackState.writeOffset + sizeof(rec) > trackPart->size) {
+        trackState.writeOffset = 0;
+    }
+
+    // Erase the 4KB sector if entering a new one
+    uint16_t sector = trackState.writeOffset / 4096;
+    if (sector != trackState.lastEraseSector) {
+        size_t eraseOff = sector * 4096;
+        size_t eraseSz = 4096;
+        if (eraseOff + eraseSz > trackPart->size) {
+            eraseSz = trackPart->size - eraseOff;
+        }
+        esp_partition_erase_range(trackPart, eraseOff, eraseSz);
+        trackState.lastEraseSector = sector;
+    }
+
+    esp_partition_write(trackPart, trackState.writeOffset, &rec, sizeof(rec));
+    trackState.writeOffset += sizeof(rec);
+    trackState.totalRecords++;
+}
+
 void goDeepSleep() {
     fsmStateRTC = fsm.state;
     if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
@@ -926,6 +1024,8 @@ void setup() {
     };
     esp_task_wdt_init(&wdtConfig);
     esp_task_wdt_add(NULL);  // subscribe loop() task (core 1)
+
+    initTracker();  // init flight log ring buffer on flash
 
     // Restore runtime FSM state from RTC
     fsm.state = fsmStateRTC;
