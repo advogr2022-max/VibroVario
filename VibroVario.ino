@@ -727,6 +727,76 @@ void startFlight() {
     }
 }
 
+void runSelfTest() {
+    // Check buttons: the wake button (UP) is expected to be pressed.
+    // Only flag other buttons as stuck if they are also held.
+    // Buttons are active LOW (pullup, short to GND when pressed).
+    bool btnStuck[3] = { false, false, false };
+    delay(10);  // settle after wake
+    // Skip BTN_UP [2] — that's the wake button, expected to be held
+    if (!digitalRead(BTN_DOWN)) btnStuck[0] = true;
+    if (!digitalRead(BTN_OK))   btnStuck[1] = true;
+
+    // Check sensors
+    bool baroOK = false, accOK = false;
+    digitalWrite(PIN_VARIO_EN, 1);
+    delay(10);
+    if (bmp.begin_I2C(0x77) || bmp.begin_I2C(0x76)) {
+        baroOK = true;
+        bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+        bmp.setPressureOversampling(BMP3_OVERSAMPLING_2X);
+        bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+    }
+    Wire.beginTransmission(ADDR_BMA); Wire.write(0x00);
+    if (Wire.endTransmission() == 0) {
+        Wire.requestFrom(ADDR_BMA, 1);
+        accOK = Wire.available() && (Wire.read() == 0x11);
+    }
+    digitalWrite(PIN_VARIO_EN, 0);
+
+    // Build message
+    String msg;
+    if (btnStuck[0] || btnStuck[1]) {
+        msg += "BTN:";
+        if (btnStuck[0]) msg += " DOWN";
+        if (btnStuck[1]) msg += " OK";
+    }
+    if (!baroOK)   { if (msg.length()) msg += " "; msg += "BARO FAIL"; }
+    if (!accOK)    { if (msg.length()) msg += " "; msg += "ACCEL FAIL"; }
+
+    // Check battery
+    float battV = analogReadMilliVolts(PIN_BATT)/1000.0*2.0;
+    if (battV < 3.4f) { if (msg.length()) msg += " "; msg += "LOW BATT"; }
+
+    // Show warning if any issue found
+    if (msg.length() > 0) {
+        display.setFullWindow();
+        display.firstPage();
+        do {
+            display.fillScreen(GxEPD_WHITE);
+            display.setTextColor(GxEPD_BLACK);
+            drawItem(-1, 30, &FreeSansBold18pt7b, "SELF-TEST");
+            display.setCursor(10, 70);
+            display.setFont(&FreeSansBold9pt7b);
+            // Split message into lines of max ~28 chars
+            int from = 0, y = 70;
+            while (from < (int)msg.length()) {
+                int to = msg.indexOf(' ', from + 28);
+                if (to < 0 || to > from + 35) to = msg.indexOf(' ', from + 20);
+                if (to < 0) to = msg.length();
+                display.setCursor(10, y);
+                display.print(msg.substring(from, to));
+                y += 20;
+                from = to + 1;
+            }
+            drawItem(-1, 170, &FreeSansBold9pt7b, "Check device");
+        } while (display.nextPage());
+        // Hold warning for 5 seconds
+        unsigned long startMs = millis();
+        while (millis() - startMs < 5000) { delay(10); }
+    }
+}
+
 void goDeepSleep() {
     fsmStateRTC = fsm.state;
     if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
@@ -807,6 +877,7 @@ void setup() {
             if (wakePin & BIT64(BTN_UP)) {
                 // Wake by UP button — show clock
                 drawClock(true);
+                runSelfTest();
                 fsmStateRTC = FSM_CLOCK;
                 fsm.state = FSM_CLOCK;
             }
