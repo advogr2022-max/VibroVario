@@ -2,6 +2,31 @@
 
 **Firmware version:** 1.5e  
 **Fork of:** [VibroVario](https://github.com/isemaster/VibroVario) by isemaster  
+
+## Differences from parent project
+
+| Area | VibroVario (original) | VibroVarioAuto (fork) |
+|------|----------------------|----------------------|
+| Version | 1.1 (EMA filter) | 1.5e (FSM) |
+| Lines of code | ~549 | ~1077 |
+| Sound | Vibration only | Vibration + Brauneiger-style buzzer |
+| Filter | Simple EMA smoothing | Complementary: gravity-vector + baro |
+| Architecture | Linear code | Finite state machine (5 states) |
+| Dispatcher | `if (state == X)` scattered | `switch(fsm.state)` — table-driven |
+| Hidden state | `static` locals | `struct VarioFsm` — zero static |
+| Buttons | BACK/SELECT/RIGHT | UP/OK/DOWN — any wakes |
+| Wake source | Only BACK (GPIO 25) | Any button (UP/OK/DOWN) |
+| Settings | None | Settings screen: Buzzer/Vibro ON/OFF |
+| Self-test | None | SELF-TEST on button wake |
+| BMP failure | Silent freeze | SENSOR FAIL overlay |
+| Accelerometer | Magnitude only | Chip ID check + fallback |
+| Task shutdown | Immediate vTaskDelete | Flag + delay — safe I2C |
+| Sleep logic | Fixed | Smart: motionTime, 15 min → 24h |
+| Config style | `#define` | `constexpr` |
+| Code language | Russian | English (100%) |
+
+---
+
 **License:** MIT
 
 ---

@@ -1,4 +1,4 @@
-# VibroVarioAuto v1.5b
+# VibroVarioAuto v1.5e
 
 **Автоматический вариометр для параплана на ESP32 Watchy**
 
@@ -6,6 +6,29 @@
 
 Форк/порт оригинального [VibroVario](https://github.com/isemaster/VibroVario) от isemaster.
 Оригинал — ESP32 Watchy, BMP390, BMA423, E-Ink 1.54".
+
+**Отличия от родительского проекта:**
+
+| Область | VibroVario (оригинал) | VibroVarioAuto (форк) |
+|---------|----------------------|----------------------|
+| Версия | 1.1 (EMA filter) | 1.5e (FSM) |
+| Строк кода | ~549 | ~1077 |
+| Звук | Только вибро | Вибро + буззер Brauneiger-style |
+| Фильтр | EMA (простое сглаживание высоты) | Комплементарный: gravity-vector из акселерометра + барo |
+| Архитектура | Линейный код | Конечный автомат (5 состояний: CLOCK, SETTINGS, CALIBRATING, RUNNING, STOPPED) |
+| Диспетчер | `if (state == X)` размазан по коду | `switch(fsm.state)` — табличный, entry/exit actions |
+| Скрытые состояния | `static` переменные в loop() и varioTask | Все состояния в `struct VarioFsm` — ноль static locals |
+| Кнопки | BACK/SELECT/RIGHT (GPIO 26/35/4) | UP/OK/DOWN (GPIO 25/4/35) — любая будит |
+| Пробуждение | Только UP (GPIO 25) | UP, OK, DOWN — любая кнопка |
+| Настройки | Нет | Экран Settings: Buzzer ON/OFF, Vibro ON/OFF |
+| Самодиагностика | Нет | SELF-TEST при пробуждении (кнопки, датчики, батарея) |
+| Обнаружение отказа BMP | Нет — тихо замирает | SENSOR FAIL на экране полёта |
+| Акселерометр | Проверка магнитуды | Chip ID верификация (0x11), fallback при отказе |
+| Управление задачей | `vTaskDelete()` в любой момент | `vfsm.running = false` + задержка — безопасное завершение I2C |
+| init дисплея | Всегда полный | Пропускается при RTC alarm wake (экономия 200 мс) |
+| Сон | Фиксированный (всегда 60 с или 24ч) | Умный: счётчик motionTime, 15 мин без движения → 24ч |
+| Конфиги | `#define` | `constexpr` (типобезопасно) |
+| Комментарии | Русские | Английские (100%)
 
 ![Watchy](media/watchy.jpeg)
 
