@@ -109,7 +109,7 @@ struct VarioFsm {
 // Runtime FSM data (not RTC — reset on each wake)
 struct FsmRuntime {
     FsmState state;
-    bool lastBtn[3];
+    bool lastBtn[4];
     int settingsRow;       // 0-5: buzzer, vibro, time, alt, wifi, sensitivity
     int editPhase;         // 0=idle, 1=editing hours/high byte, 2=editing minutes/low byte, 3=editing sensitivity
 } fsm;
@@ -131,6 +131,9 @@ portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 TaskHandle_t vTaskH = NULL;
 
 VarioEMA varioEMA;
+
+bool showTestResult = false;                         // Flag: display test result on settings screen
+String testResult;                                   // Last self-test result text
 
 // Read altitude using user-set QNH. Wraps BMP library call.
 float readAlt() { return bmp.readAltitude(userQNH); }
@@ -517,13 +520,6 @@ void drawClock(bool fullInit) {
         drawItem(-1, 110, &FreeSansBold24pt7b, buf);
         sprintf(buf, "%02d.%02d", rtc_d, rtc_mon);
         drawItem(-1, 160, &FreeSansBold18pt7b, buf);
-
-        // Button labels in corners (tiny 9pt)
-        display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(2, 10);   display.print("1");  // top-left: MENU
-        display.setCursor(188, 10); display.print("2");  // top-right: UP
-        display.setCursor(2, 196);  display.print("3");  // bottom-left: OK
-        display.setCursor(188, 196);display.print("4");  // bottom-right: DOWN (settings)
     } while (display.nextPage());
 }
 
@@ -581,8 +577,19 @@ void drawSettings() {
         else sprintf(buf, "[%d]", varioSensitivity);
         display.println(buf);
 
-        drawItem(-1, 175, &FreeSansBold9pt7b,
-            fsm.editPhase > 0 ? "UP/DOWN-adj  OK-save" : "UP-exit  DOWN-next  OK-act");
+        // Row 6: Self-test
+        display.setCursor(10, 170);
+        display.print(fsm.settingsRow == 6 ? ">" : " ");
+        display.print("Test:   ");
+        display.println(showTestResult ? "" : "[RUN]");
+
+        if (showTestResult) {
+            display.setCursor(80, 170);
+            display.println(testResult);
+        }
+
+        drawItem(-1, 190, &FreeSansBold9pt7b,
+            fsm.editPhase > 0 ? "PRESS3=+  PRESS4=-  OK=save" : "PRESS4=down  PRESS2=back  OK=sel");
     } while (display.nextPage());
 }
 
@@ -698,11 +705,12 @@ void runSelfTest() {
     // Check buttons: the wake button (UP) is expected to be pressed.
     // Only flag other buttons as stuck if they are also held.
     // Buttons are active LOW (pullup, short to GND when pressed).
-    bool btnStuck[3] = { false, false, false };
+    bool btnStuck[4] = { false, false, false, false };
     delay(10);  // settle after wake
     // Skip BTN_UP [2] — that's the wake button, expected to be held
     if (!digitalRead(BTN_DOWN)) btnStuck[0] = true;
     if (!digitalRead(BTN_OK))   btnStuck[1] = true;
+    if (!digitalRead(BTN_EDIT)) btnStuck[3] = true;
 
     // Check sensors
     bool baroOK = false, accOK = false;
@@ -762,6 +770,38 @@ void runSelfTest() {
         unsigned long startMs = millis();
         while (millis() - startMs < 5000) { delay(10); }
     }
+}
+
+// Self-test returning result string (for settings menu display)
+String runSelfTestStr() {
+    bool btnStuck[3] = { false, false, false };
+    delay(10);
+    if (!digitalRead(BTN_DOWN)) btnStuck[0] = true;
+    if (!digitalRead(BTN_OK))   btnStuck[1] = true;
+
+    bool baroOK = false, accOK = false;
+    digitalWrite(PIN_VARIO_EN, 1);
+    delay(10);
+    if (bmp.begin_I2C(0x77) || bmp.begin_I2C(0x76)) {
+        baroOK = true;
+        bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+        bmp.setPressureOversampling(BMP3_OVERSAMPLING_2X);
+        bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+    }
+    Wire.beginTransmission(ADDR_BMA); Wire.write(0x00);
+    if (Wire.endTransmission() == 0) {
+        Wire.requestFrom(ADDR_BMA, 1);
+        accOK = Wire.available() && (Wire.read() == 0x11);
+    }
+    digitalWrite(PIN_VARIO_EN, 0);
+
+    String msg;
+    if (!baroOK) msg += "BARO";
+    if (!accOK)  { if (msg.length()) msg += " "; msg += "ACC"; }
+    float battV = analogReadMilliVolts(PIN_BATT)/1000.0*2.0;
+    if (battV < 3.4f) { if (msg.length()) msg += " "; msg += "BAT"; }
+    if (msg.length() == 0) msg = "OK";
+    return msg;
 }
 
 // --- FLIGHT TRACKER ---
@@ -1207,9 +1247,8 @@ void goDeepSleep() {
     ledcDetachPin(BUZZER_PIN);
     display.hibernate(); Wire.end(); WiFi.mode(WIFI_OFF);
 
-    // Wake sources: all 3 buttons (active HIGH, default 0, pressed 1)
-    // RTC alarm and BMA motion: handled via polling on wake from button
-    const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN);
+    // Wake sources: all 4 buttons (active HIGH, default 0, pressed 1)
+    const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN) | BIT64(BTN_EDIT);
     esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
     esp_task_wdt_deinit();
     esp_deep_sleep_start();
@@ -1219,17 +1258,16 @@ void setup() {
     pinMode(BTN_DOWN, INPUT);
     pinMode(BTN_OK, INPUT);
     pinMode(BTN_UP, INPUT);
+    pinMode(BTN_EDIT, INPUT);
     pinMode(PIN_VARIO_EN, OUTPUT);
     pinMode(PIN_VIBRO, OUTPUT);
     pinMode(PIN_BATT, INPUT);
-    pinMode(ACC_INT_1_PIN, INPUT);  // BMA motion interrupt
-    pinMode(RTC_INT_PIN, INPUT);    // RTC alarm interrupt
     digitalWrite(PIN_VARIO_EN, 0);
     digitalWrite(PIN_VIBRO, 0);
 
-    // Initialize buzzer (PWM) — ESP32 Core 3.x API
-    ledcSetup(BUZZER_CHANNEL, BZ_CLIMB_BASE, 8);             // Core 2.x: setup channel
-    ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);                // then attach pin to channel
+    // Initialize buzzer (PWM)
+    ledcSetup(BUZZER_CHANNEL, BZ_CLIMB_BASE, 8);
+    ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
     ledcWrite(BUZZER_CHANNEL, 0);                   // silent at startup
 
     Wire.begin();
@@ -1283,7 +1321,6 @@ void setup() {
         else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
             // Wake by any button — show clock
             drawClock(true);
-            runSelfTest();
             fsmStateRTC = FSM_CLOCK;
             fsm.state = FSM_CLOCK;
         }
@@ -1303,21 +1340,18 @@ void loop() {
     esp_task_wdt_reset();
     // === FSM TICK ===
     // Buttons: active HIGH (default LOW=0, pressed HIGH=1)
-    bool btn[3] = { digitalRead(BTN_DOWN), digitalRead(BTN_OK), digitalRead(BTN_UP) };
-    bool anyBtn = btn[0] || btn[1] || btn[2];
+    // [0]=DOWN (GPIO35), [1]=OK (GPIO26), [2]=UP (GPIO25), [3]=EDIT (GPIO4)
+    bool btn[4] = { digitalRead(BTN_DOWN), digitalRead(BTN_OK), digitalRead(BTN_UP), digitalRead(BTN_EDIT) };
+    bool anyBtn = btn[0] || btn[1] || btn[2] || btn[3];
     unsigned long now = millis();
 
     // Rising-edge detection with 50ms debounce delay.
-    // fsm.lastBtn stores previous state for edge comparison.
-    // Index mapping: [0]=DOWN, [1]=OK, [2]=UP.
-    // Debounce: detection on rising edge (0→1, active HIGH)
-    bool press[3] = { false, false, false };
-    for (int i = 0; i < 3; i++) {
+    bool press[4] = { false, false, false, false };
+    for (int i = 0; i < 4; i++) {
         if (btn[i] && !fsm.lastBtn[i]) {
             delay(50);
-            if (digitalRead(i == 0 ? BTN_DOWN : (i == 1 ? BTN_OK : BTN_UP))) {
-                press[i] = true;
-            }
+            int p = (i==0 ? BTN_DOWN : (i==1 ? BTN_OK : (i==2 ? BTN_UP : BTN_EDIT)));
+            if (digitalRead(p)) { press[i] = true; }
         }
         fsm.lastBtn[i] = btn[i];
     }
@@ -1326,28 +1360,24 @@ void loop() {
     switch (fsm.state) {
 
     case FSM_CLOCK: {
-        // CLOCK state: device is awake briefly between deep sleep cycles.
-        // Buttons checked first (DOWN→settings, OK→flight, UP→sleep).
-        // If no button: motion tracking + RTC alarm timing → goDeepSleep().
-        // DOWN → settings
-        if (press[0]) {
+        // [0]=DOWN (btn4) → settings    [1]=OK (btn1) → fly
+        // [2]=UP (btn2) → sleep          [3]=EDIT (btn3) → no-op
+        if (press[0]) {  // DOWN → settings
             fsm.state = FSM_SETTINGS;
             fsm.settingsRow = 0; fsm.editPhase = 0;
             drawSettings();
             return;
         }
-        // OK → start flight
-        if (press[1]) {
+        if (press[1]) {  // OK → start flight
             fsm.state = FSM_CALIBRATING;
             startFlight();
             return;
         }
-        // UP → deep sleep (until next button press)
-        if (press[2]) {
+        if (press[2]) {  // UP → sleep
             setRTCAlarmSec(CLOCK_SLEEP_STILL);
             goDeepSleep();
         }
-        // No button → sleep (wake on next button press via ANY_HIGH)
+        // No button → sleep after 15s idle
         if (!anyBtn) {
             // Stay awake 15s after wake so user can press a button
             if (millis() < 15000) { return; }
@@ -1364,7 +1394,8 @@ void loop() {
     case FSM_SETTINGS: {
         // Edit mode (time or QNH adjustment active)
         if (fsm.editPhase > 0) {
-            if (press[2]) { // UP → increase
+            // EDIT (btn3, press[3]) or UP (btn2, press[2]) → increase
+            if (press[3] || press[2]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 1) % 24;
                     else rtc_m = (rtc_m + 1) % 60;
@@ -1376,7 +1407,8 @@ void loop() {
                 }
                 drawSettings(); return;
             }
-            if (press[0]) { // DOWN → decrease
+            // DOWN (btn4, press[0]) → decrease
+            if (press[0]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 23) % 24;
                     else rtc_m = (rtc_m + 59) % 60;
@@ -1388,7 +1420,8 @@ void loop() {
                 }
                 drawSettings(); return;
             }
-            if (press[1]) { // OK → save and compute QNH
+            // OK (btn1, press[1]) → save
+            if (press[1]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) fsm.editPhase = 2;
                     else { writeTimeToRTC(rtc_h, rtc_m); fsm.editPhase = 0; }
@@ -1396,7 +1429,7 @@ void loop() {
                     computeQNHfromAlt(userAltM);
                     fsm.editPhase = 0;
                 } else {
-                    fsm.editPhase = 0;  // sensitivity: save on OK
+                    fsm.editPhase = 0;
                 }
                 drawSettings(); return;
             }
@@ -1404,26 +1437,33 @@ void loop() {
         }
 
         // Normal settings navigation
-        if (press[1]) { // OK on current row
+        if (press[1]) { // OK (btn1) on current row
             if (fsm.settingsRow == 0) { buzzerEnabled = !buzzerEnabled; drawSettings(); return; }
             if (fsm.settingsRow == 1) { vibroEnabled = !vibroEnabled; drawSettings(); return; }
             if (fsm.settingsRow == 2) { fsm.editPhase = 1; drawSettings(); return; }
             if (fsm.settingsRow == 3) { fsm.editPhase = 1; drawSettings(); return; }
             if (fsm.settingsRow == 4) {
-                // Start WiFi web export mode
                 fsm.state = FSM_WEB_EXPORT;
                 return;
             }
             if (fsm.settingsRow == 5) { fsm.editPhase = 3; drawSettings(); return; }
+            if (fsm.settingsRow == 6) {
+                // Run self-test and show result
+                showTestResult = true;
+                testResult = runSelfTestStr();
+                drawSettings(); return;
+            }
         }
-        if (press[0]) { // DOWN → next row
-            fsm.settingsRow = (fsm.settingsRow + 1) % 6;
+        if (press[0]) { // DOWN (btn4) → next row
+            fsm.settingsRow = (fsm.settingsRow + 1) % 7;  // 0..6
+            showTestResult = false;
             drawSettings(); return;
         }
-        if (press[2]) { // UP → exit to clock
+        if (press[2]) { // UP (btn2) → back to clock
             readRTC(); drawClock(true);
             fsm.state = FSM_CLOCK;
             fsm.editPhase = 0;
+            showTestResult = false;
             return;
         }
         delay(50);

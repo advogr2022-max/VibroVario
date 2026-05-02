@@ -46,10 +46,15 @@ constexpr int V_PAUSE  = 500;                      // Long pause between bursts 
 constexpr int VIBRO_COOLDOWN_MS = 200;             // Cooldown after vibration before accel read
 
 // --- GPIO PINS ---
-constexpr int BTN_OK = 4;                          // Bottom-left: confirm/stop
-constexpr int PIN_VARIO_EN = 26;                   // Sensor power control pin
-constexpr int BTN_DOWN = 35;                       // Bottom-right: start/down
-constexpr int BTN_UP = 25;                         // Top-right: back to clock/up
+// Button 1: GPIO 26 = OK (confirm/enter) — was PIN_VARIO_EN
+// Button 2: GPIO 25 = UP (navigation up)
+// Button 3: GPIO  4 = EDIT (change value)
+// Button 4: GPIO 35 = DOWN (navigation down)
+constexpr int BTN_OK = 26;                          // Button 1: confirm/enter
+constexpr int BTN_EDIT = 4;                         // Button 3: change value
+constexpr int BTN_UP = 25;                          // Button 2: navigation up
+constexpr int BTN_DOWN = 35;                        // Button 4: navigation down
+constexpr int PIN_VARIO_EN = 33;                   // Dummy pin — BMP not connected
 constexpr int PIN_VIBRO = 13;                      // Vibration motor pin
 constexpr int PIN_BATT = 34;                       // Battery ADC pin
 
