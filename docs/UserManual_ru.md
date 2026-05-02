@@ -388,8 +388,8 @@ A: Так и задумано — WiFi жрёт ~80 мА. Автоотключе
 ### Структура проекта
 
 ```
-VibroVario/                    ← папка скетча
-├── VibroVario.ino             ← главный файл (открывать в Arduino IDE)
+VibroVario/                    ← папка скетча (при клоне через git)
+├── VibroVario-main.ino        ← главный файл (открывать в Arduino IDE)
 ├── config.h                   ← пины, константы, настройки фильтра
 ├── VarioEMA.h                 ← класс комплементарного фильтра
 ├── README.md                  ← описание проекта (русский)
@@ -413,7 +413,7 @@ VibroVario/                    ← папка скетча
 7. **Параметры платы:**
    - Flash Size: `4MB (32Mb)`
    - Partition Scheme: `Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)`
-8. **Открыть файл** — Файл → Открыть → выбрать папку `VibroVario` → откроется `VibroVario.ino`
+8. **Открыть файл** — Файл → Открыть → выбрать папку `VibroVario-main` → откроется `VibroVario-main.ino`
 9. **Нажать Upload** (→)
 
 Файлы `config.h` и `VarioEMA.h` подхватятся автоматически — их не нужно добавлять вручную.

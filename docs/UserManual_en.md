@@ -295,8 +295,8 @@ Battery: 200 mAh LiPo (3.7V). 4.2V = 100%, 3.3V = 0%.
 ### Project Structure
 
 ```
-VibroVario/                    ← sketch folder
-├── VibroVario.ino             ← main file (open in Arduino IDE)
+VibroVario/                    ← sketch folder (when cloned via git)
+├── VibroVario-main.ino        ← main file (open in Arduino IDE)
 ├── config.h                   ← pins, constants, filter settings
 ├── VarioEMA.h                 ← complementary filter class
 ├── README.md                  ← project description
@@ -320,7 +320,7 @@ VibroVario/                    ← sketch folder
 7. **Board settings:**
    - Flash Size: `4MB (32Mb)`
    - Partition Scheme: `Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)`
-8. **Open sketch** — File → Open → select the `VibroVario` folder → `VibroVario.ino` opens
+8. **Open sketch** — File → Open → select the `VibroVario-main` folder → `VibroVario-main.ino` opens
 9. **Click Upload** (→)
 
 `config.h` and `VarioEMA.h` are auto-detected — no manual file adding needed.
