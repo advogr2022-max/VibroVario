@@ -27,6 +27,8 @@
 | WiFi export | None | AP VibroVario + HTTP: CSV export |
 | Config style | `#define` | `constexpr` |
 | Code language | Russian | English (100%) |
+| Sensitivity | Fixed | Adjustable 0-9, affects filter response |
+| Flight logging | None | Ring buffer with per-record date in CSV |
 
 ---
 
@@ -230,12 +232,27 @@ Each CSV record: `FLT;DATE;TIME;ALT_M`
 ### On-Device (DOWN in CLOCK)
 
 | Row | Parameter | OK action |
-|-----|-----------|-----------|
+|-----|-----------|----------|
 | 0 | Buzzer: ON/OFF | Toggle |
 | 1 | Vibro: ON/OFF | Toggle |
 | 2 | Time: HH:MM | Enter edit (UP/DOWN change, OK next digit) |
 | 3 | Alt: 300m | Enter edit (UP/DOWN +5/-5, OK save + compute QNH) |
 | 4 | WiFi: [OFF] | Start WiFi export mode |
+| 5 | Sens: [4] | Enter edit (UP/DOWN 0..9, OK save) |
+
+Settings persist across deep sleep (stored in RTC memory).
+
+### Sensitivity (Sens: 0-9)
+
+Controls how fast the variometer responds to vertical movements.
+
+| Value | Response | Use case |
+|-------|----------|----------|
+| 0-2 | **Fast** — reacts instantly, more noise | Active acro, speed flying, quick thermal detection |
+| 3-5 | **Balanced** (default 4) — clean signal, good response | General paragliding, cross-country |
+| 6-9 | **Slow** — smooth, ignores small bumps, slight lag | Soaring, thermalling in light air, sensitive pilots |
+
+Internally adjusts the complementary filter crossover: lower values let the accelerometer dominate for faster response; higher values let the barometer dominate for smoother output.
 
 ### Via Browser
 
