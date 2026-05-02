@@ -23,80 +23,8 @@
 #include "FreeMonoBold36pt7b.h"
 #include <cmath>
 
-// --- FILTER CONFIG ---
-constexpr float CFG_TAU_BARO_ALT        = 0.1f;   // Altitude smoothing time constant (s)
-constexpr float CFG_TAU_BARO_VARIO_BASE = 0.3f;   // Base vario time constant (calm air)
-constexpr float CFG_TAU_BARO_VARIO_TURB = 0.3f;   // Vario time constant in turbulence
-constexpr float CFG_TAU_ACCEL           = 0.1f;   // Accelerometer filter time constant
-constexpr float CFG_ACCEL_TURB_REF      = 2.0f;   // Reference accel (m/s²) for turbulence level
-constexpr float CFG_VARIO_SENS          = 1.0f;   // Vario sensitivity scaling factor
-constexpr float CFG_TAU_COMPLEMENTARY   = 3.0f;   // Complementary filter time constant (s)
-                                         // > 3s: baro dominates, < 3s: IMU dominates
-constexpr float CFG_TAU_GRAVITY_VEC     = 2.0f;   // Gravity vector LPF time constant (s)
-                                         // Determines "down" regardless of watch orientation
-
- // --- SYSTEM CONFIG ---
-constexpr unsigned long REFRESH_MS = 1000;         // Display refresh period (ms)
-constexpr int LOOP_HZ = 50;                        // Main processing loop frequency (Hz)
-constexpr float SINK_TRH = -5.0f;                  // Hard sink alarm threshold (m/s)
-constexpr float ISA_H = 44330.769f;                // Standard atmosphere scale height
-constexpr float ISA_POW = 5.255876f;               // Standard atmosphere exponent
-
-// --- POWER SAVE ---
-constexpr int CLOCK_SLEEP_MOTION = 60;             // Sleep with motion (s)
-constexpr int CLOCK_SLEEP_STILL = 86400;           // Sleep without motion (24h)
-constexpr float FLIGHT_DETECT_VZ = 0.75f;          // Vz threshold for auto-flight start (m/s)
-constexpr float LANDING_DETECT_VZ = 0.75f;         // Vz threshold for landing detection (m/s)
-constexpr int LANDING_DETECT_SEC = 300;            // 5 min idle before auto-landing
-
-// --- ACCELEROMETER CONFIG ---
-constexpr float GRAVITY_G = 9.80665f;              // Standard gravity
-
-// --- VIBRO PULSE THRESHOLDS ---
-// Vertical speed thresholds (m/s) and corresponding vibration pulse count per burst
-const float LIFT_TH[]    = {0.15f, 0.4f, 1.0f, 2.0f, 1000.0f}; 
-const int   LIFT_PULSES[] = {1, 2, 3, 4};
-
-// --- VIBRATION TIMING ---
-constexpr int V_PULSE = 30;                        // Single vibration pulse duration (ms)
-constexpr int V_GAP    = 100;                      // Gap between pulses in a burst (ms)
-constexpr int V_PAUSE  = 500;                      // Long pause between bursts (ms)
-constexpr int VIBRO_COOLDOWN_MS = 200;              // Cooldown after vibration before accel read (noise protection)
-
-// --- GPIO PINS ---
-constexpr int BTN_OK = 4;                          // Bottom-left: confirm/stop
-constexpr int PIN_VARIO_EN = 26;                   // Sensor power control pin
-constexpr int BTN_DOWN = 35;                       // Bottom-right: start/down
-constexpr int BTN_UP = 25;                         // Top-right: back to clock/up
-constexpr int PIN_VIBRO = 13;                       // Vibration motor pin
-constexpr int PIN_BATT = 34;                        // Battery ADC pin
-
-// --- BUZZER (Brauneiger-style) ---
-// Free pins on Watchy V2: GPIO 16, 17, or 32.
-// Warning: on V1/V1.5 GPIO 32 = UP_BTN, use 16 or 17 instead.
-constexpr int BUZZER_PIN = 32;                     // Buzzer PWM pin
-
-// Tone settings (Brauneiger IQ style)
-constexpr float BZ_SILENT_MIN = -0.3f;              // Silent zone lower bound (m/s)
-constexpr float BZ_SILENT_MAX = 0.3f;               // Silent zone upper bound (m/s)
-constexpr int BZ_CLIMB_BASE = 700;                  // Climb base frequency (Hz)
-constexpr int BZ_CLIMB_MOD = 200;                    // Frequency increase per m/s (Hz)
-constexpr int BZ_CLIMB_MAX = 2200;                   // Maximum climb frequency (Hz)
-constexpr int BZ_SINK_FREQ = 500;                    // Sink frequency (Hz)
-constexpr float BZ_SINK_ALARM = -3.0f;               // Emergency sink alarm threshold (m/s)
-constexpr int BZ_BEAT_BASE = 600;                    // Base beat duration (ms) at Vz=0
-constexpr int BZ_BEAT_MIN = 80;                      // Minimum beat duration (ms)
-constexpr float BZ_BEAT_RATE = 2.0f;                 // Beat acceleration factor vs Vz
-
-// --- DISPLAY & I2C ---
-constexpr int EPD_CS = 5;                            // E-Ink chip select
-constexpr int EPD_RES = 9;                           // E-Ink reset
-constexpr int EPD_DC = 10;                           // E-Ink data/command
-constexpr int EPD_BUSY = 19;                         // E-Ink busy
-constexpr uint8_t ADDR_BMA = 0x18;                   // BMA423 I2C address
-constexpr uint8_t ADDR_RTC = 0x51;                   // PCF8563 RTC I2C address
-constexpr int ACC_INT_1_PIN = 14;                    // BMA423 INT1 (any-motion wake)
-constexpr int RTC_INT_PIN = 27;                      // PCF8563 INT (alarm wake)
+#include "config.h"
+#include "VarioEMA.h"
 
 // --- GLOBAL STATE ---
 enum FsmState { FSM_CLOCK, FSM_SETTINGS, FSM_CALIBRATING, FSM_RUNNING, FSM_STOPPED, FSM_WEB_EXPORT };
@@ -201,142 +129,6 @@ GxEPD2_BW<GxEPD2_154_D67, 200> display(GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RES, E
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 TaskHandle_t vTaskH = NULL;
 
-// --- VARIO FILTER CLASS (Gravity-aligned IMU + Baro) ---
-// Vertical direction determined from filtered accelerometer vector (gravity vector).
-// Projection of current acceleration onto gravity gives vertical acceleration regardless
-// of watch orientation. Complementary filter: IMU (fast) + Baro (accurate).
-// Turbulence computed from magnitude (all axes).
-// Complementary filter: gravity-vector estimation from accelerometer LPF,
-// projected acceleration gives vertical acceleration regardless of watch orientation.
-// Turbulence magnitude computed from all 3 axes (orientation-independent).
-// Fusion: IMU (fast, drifts) high-pass + Baro (slow, accurate) low-pass.
-class VarioEMA {
-  float altFilt_        = 0.0f;
-  float altPrev_        = 0.0f;
-  float varioFilt_      = 0.0f;
-  float accelLinFilt_   = 0.0f;
-  float velInertial_    = 0.0f;   // Integrated accelerometer velocity
-  float velInertialLP_  = 0.0f;   // Low-pass for drift removal
-  float varioBaroLP_    = 0.0f;   // Low-pass baro vario
-
-  float tauComp_        = 3.0f;   // Complementary filter time constant (runtime-adjustable)
-
-  // Gravity vector estimation (LPF on raw accel)
-  float gxEst_ = 0.0f, gyEst_ = 0.0f, gzEst_ = 0.0f;  // Low-frequency gravity estimate (G)
-
-  bool  inited_       = false;
-
-  float alphaFromTau(float dt, float tau) {
-      if (tau <= 0.0f) return 1.0f;
-      float a = dt / (tau + dt);
-      if (a < 0.0f) a = 0.0f;
-      if (a > 1.0f) a = 1.0f;
-      return a;
-  }
-
-public:
-  void init(float initialAlt) {
-      altFilt_       = initialAlt;
-      altPrev_       = initialAlt;
-      varioFilt_     = 0.0f;
-      accelLinFilt_  = 0.0f;
-      velInertial_   = 0.0f;
-      velInertialLP_ = 0.0f;
-      varioBaroLP_   = 0.0f;
-      gxEst_ = 0.0f; gyEst_ = 0.0f; gzEst_ = 0.0f;
-      tauComp_       = 3.0f;  // reset to default
-      inited_        = true;
-  }
-
-  void setTauComp(float t) { if (t > 0.1f && t < 20.0f) tauComp_ = t; }
-
-  // Main filter update method.
-  // ax_raw, ay_raw, az_raw — raw accelerometer readings (units: G, ±8g range)
-  // accelMagMs2            — linear acceleration magnitude (m/s²), for turbulence
-  // baroAlt                — raw barometer altitude
-  float update(float ax_raw, float ay_raw, float az_raw,
-               float accelMagMs2, float baroAlt, float dt) {
-      if (dt < 0.001f) dt = 0.001f;
-      if (dt > 0.1f)   dt = 0.1f;
-
-      if (!inited_) {
-          init(baroAlt);
-      }
-
-      // 1. Gravity direction estimation (LPF of accelerometer vector)
-      //    Regardless of watch orientation, this vector points "down"
-      float aGrav = alphaFromTau(dt, CFG_TAU_GRAVITY_VEC);
-      gxEst_ += aGrav * (ax_raw - gxEst_);
-      gyEst_ += aGrav * (ay_raw - gyEst_);
-      gzEst_ += aGrav * (az_raw - gzEst_);
-
-      // Normalize gravity vector
-      float gNorm = sqrtf(gxEst_*gxEst_ + gyEst_*gyEst_ + gzEst_*gzEst_);
-      if (gNorm > 0.001f) {
-          float invG = 1.0f / gNorm;
-          gxEst_ *= invG;
-          gyEst_ *= invG;
-          gzEst_ *= invG;
-      } else {
-          gxEst_ = 0.0f; gyEst_ = 0.0f; gzEst_ = 1.0f;
-      }
-
-      // 2. Project current acceleration onto gravity => vertical linear acceleration
-      float accelVerticalG = ax_raw*gxEst_ + ay_raw*gyEst_ + az_raw*gzEst_ - 1.0f;
-      if (fabsf(accelVerticalG) < 0.02f) accelVerticalG = 0.0f; // deadzone
-      float azMs2 = accelVerticalG * GRAVITY_G;
-
-      // 3. Filter acceleration magnitude (for turbulence)
-      float aAcc = alphaFromTau(dt, CFG_TAU_ACCEL);
-      accelLinFilt_ += aAcc * (accelMagMs2 - accelLinFilt_);
-
-      // 4. Altitude filtering
-      float aAlt = alphaFromTau(dt, CFG_TAU_BARO_ALT);
-      altFilt_ += aAlt * (baroAlt - altFilt_);
-
-      // 5. Baro vario (altitude derivative)
-      float varioRaw = (altFilt_ - altPrev_) / dt;
-      altPrev_ = altFilt_;
-
-      // 6. Adapt vario tau based on turbulence
-      float turb = fabsf(accelLinFilt_);
-      float turbNorm = 0.0f;
-      if (CFG_ACCEL_TURB_REF > 0.0f) {
-          turbNorm = turb / CFG_ACCEL_TURB_REF;
-          if (turbNorm > 1.0f) turbNorm = 1.0f;
-      }
-      float tauVario = CFG_TAU_BARO_VARIO_BASE + turbNorm * CFG_TAU_BARO_VARIO_TURB;
-      float aVario = alphaFromTau(dt, tauVario);
-
-      // 7. Low-pass baro vario (for complementary filter)
-      varioBaroLP_ += aVario * (varioRaw - varioBaroLP_);
-
-      // 8. Complementary filter: IMU + Baro
-      velInertial_ += azMs2 * dt;                    // Integrate vertical acceleration
-
-      float aComp = alphaFromTau(dt, tauComp_);
-      velInertialLP_ += aComp * (velInertial_ - velInertialLP_);  // Drift estimation
-
-      float velInertialHP = velInertial_ - velInertialLP_;        // HP = drift-free
-
-      varioFilt_ = velInertialHP + varioBaroLP_;                  // Fusion
-
-      if (varioFilt_ >  25.0f) varioFilt_ =  25.0f;
-      if (varioFilt_ < -25.0f) varioFilt_ = -25.0f;
-
-      return varioFilt_ * CFG_VARIO_SENS;
-  }
-
-  float getAltitude() const { return altFilt_; }
-  float getVario()    const { return varioFilt_ * CFG_VARIO_SENS; }
-  float getAccelLin() const { return accelLinFilt_; }
-
-  // Access to gravity estimate (for debugging)
-  void getGravityEst(float &gx, float &gy, float &gz) const {
-      gx = gxEst_; gy = gyEst_; gz = gzEst_;
-  }
-};
-
 VarioEMA varioEMA;
 
 // Read altitude using user-set QNH. Wraps BMP library call.
@@ -346,7 +138,7 @@ float readAlt() { return bmp.readAltitude(userQNH); }
 float sensToTau(int sens) {
     if (sens < 0) sens = 0;
     if (sens > 9) sens = 9;
-    return 0.5f + (float)sens * 0.8333f;  // sens 4 → ~3.83s (close to default 3.0)
+    return 0.5f + (float)sens * 0.8333f;  // sens 4 -> ~3.83s (close to default 3.0)
 }
 
 // --- HELPER FUNCTIONS ---
