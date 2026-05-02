@@ -117,13 +117,15 @@ struct VarioFsm {
     unsigned long bzNextT = 0;
     unsigned long lastUpdateMicros = 0;
     float vSmooth = 0.0f;
+    bool running = true;
+    int bmpFailCount = 0;
     unsigned long lastActivity = 0;
     void reset() {
         pulses = 0; pulseOn = false; nextT = 0; pause = false;
         vibroActive = false; vibroStopT = 0;
         bzOn = false; bzNextT = 0;
         lastUpdateMicros = micros();
-        vSmooth = 0.0f; lastActivity = 0;
+        vSmooth = 0.0f; lastActivity = 0; running = true; bmpFailCount = 0;
     }
 };
 
@@ -139,7 +141,7 @@ struct SysData {
   float startAlt, alt, vel, maxV, minV, temp;
   float ax, ay, az;
   float gMagRef;
-  bool track, sensInit, accInit;
+  bool track, sensInit, accInit, bmpFail;
   unsigned long tStart, tScreen;
 } data;
 
@@ -379,13 +381,18 @@ void initSensors() {
         bmp.setOutputDataRate(BMP3_ODR_50_HZ);
         data.sensInit = true;
     }
-    // Configure BMA423 accelerometer (Reset, Config, Enable)\r
+    // Configure BMA423 accelerometer (Reset, Config, Enable)
     i2cWrite(ADDR_BMA, 0x7E, 0xB6); delay(20);
     i2cWrite(ADDR_BMA, 0x7C, 0x00); delay(10);
     i2cWrite(ADDR_BMA, 0x40, 0x28);
     i2cWrite(ADDR_BMA, 0x41, 0x01);
     i2cWrite(ADDR_BMA, 0x7D, 0x04); delay(50);
-    data.accInit = true;
+    // Verify BMA423 presence: chip ID register 0x00 should be 0x11
+    Wire.beginTransmission(ADDR_BMA); Wire.write(0x00);
+    if (Wire.endTransmission() == 0) {
+        Wire.requestFrom(ADDR_BMA, 1);
+        data.accInit = Wire.available() && (Wire.read() == 0x11);
+    }
 }
 
 void drawItem(int x, int y, const GFXfont* f, String txt) {
@@ -402,7 +409,7 @@ void drawItem(int x, int y, const GFXfont* f, String txt) {
 // All state in vfsm (VarioFsm), no static locals
 void varioTask(void *p) {
     for(;;) {
-        if (fsmStateRTC == FSM_RUNNING && data.sensInit) {
+        if (fsmStateRTC == FSM_RUNNING && data.sensInit && vfsm.running) {
             float ax = 0.0f, ay = 0.0f, az = 0.0f;
             float acc_lin_ms2 = 0.0f;
 
@@ -433,6 +440,8 @@ void varioTask(void *p) {
             }
 
             if (bmp.performReading()) {
+                vfsm.bmpFailCount = 0;
+                portENTER_CRITICAL(&mux); data.bmpFail = false; portEXIT_CRITICAL(&mux);
                 float baro_alt = bmp.readAltitude(SEALEVELPRESSURE_HPA);
                 float v = varioEMA.update(ax, ay, az, acc_lin_ms2, baro_alt, dt);
 
@@ -555,6 +564,12 @@ void varioTask(void *p) {
                     if (vfsm.bzOn) { ledcWrite(BUZZER_PIN, 0); vfsm.bzOn = false; }
                     vfsm.bzNextT = 0;
                 }
+                // BMP fail detection
+            } else {
+                vfsm.bmpFailCount++;
+                if (vfsm.bmpFailCount > 50) {
+                    portENTER_CRITICAL(&mux); data.bmpFail = true; portEXIT_CRITICAL(&mux);
+                }
             }
         } else {
             digitalWrite(PIN_VIBRO, 0);
@@ -592,6 +607,15 @@ void drawMain() {
         sprintf(buf, "%d%%", v>=4.2?100 : (v<=3.3?0 : (int)((v-3.3)*111.1)));
         drawItem(140, 20, &FreeSansBold9pt7b, buf);
 
+        // Sensor fail warning
+        if (data.bmpFail && (fsmStateRTC == FSM_RUNNING || fsmStateRTC == FSM_STOPPED)) {
+            display.setTextColor(GxEPD_WHITE);
+            display.fillRect(0, 40, 200, 18, GxEPD_BLACK);
+            display.setCursor(10, 55);
+            display.setFont(&FreeSansBold9pt7b);
+            display.print("SENSOR FAIL");
+            display.setTextColor(GxEPD_BLACK);
+        }
         if(fsmStateRTC == FSM_RUNNING || fsmStateRTC == FSM_STOPPED) {
             drawItem(25, 50, &FreeSansBold9pt7b, "Start, m   Sea, m");
             sprintf(buf, "%+d", (int)(dAlt - data.startAlt));
@@ -705,7 +729,7 @@ void startFlight() {
 
 void goDeepSleep() {
     fsmStateRTC = fsm.state;
-    if(vTaskH) vTaskDelete(vTaskH);
+    if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
     digitalWrite(PIN_VARIO_EN, 0); digitalWrite(PIN_VIBRO, 0);
     ledcWrite(BUZZER_PIN, 0);
     ledcDetach(BUZZER_PIN);
@@ -746,15 +770,23 @@ void setup() {
     // Restore runtime FSM state from RTC
     fsm.state = fsmStateRTC;
 
-    // Determine wake cause, then init display with proper reset behavior:
-    // - First boot (ESP_SLEEP_WAKEUP_UNDEFINED): full display init with reset
-    // - Normal wake: skip reset to avoid ghosting
+    // Determine wake cause
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    display.init(115200, true, 2, (cause == ESP_SLEEP_WAKEUP_UNDEFINED));
-    display.setRotation(1);
     uint64_t wakePin = 0;
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
         wakePin = esp_sleep_get_ext1_wakeup_status();
+    }
+
+    // Init display only for visual wake events, not silent RTC alarm checks
+    bool needDisplay = (cause == ESP_SLEEP_WAKEUP_UNDEFINED) ||
+                       (cause == ESP_SLEEP_WAKEUP_EXT1 &&
+                        (wakePin & (BIT64(BTN_UP) | BIT64(ACC_INT_1_PIN)))) ||
+                       (cause != ESP_SLEEP_WAKEUP_UNDEFINED &&
+                        (fsmStateRTC == FSM_RUNNING || fsmStateRTC == FSM_STOPPED));
+
+    if (needDisplay) {
+        display.init(115200, true, 2, (cause == ESP_SLEEP_WAKEUP_UNDEFINED));
+        display.setRotation(1);
     }
 
     if (fsmStateRTC == FSM_RUNNING && cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
@@ -783,6 +815,10 @@ void setup() {
                 readRTC();
                 if (rtc_m != lastWakeMinute || lastWakeMinute < 0) {
                     lastWakeMinute = rtc_m;
+                    if (!needDisplay) {
+                        display.init(115200, true, 2, false);
+                        display.setRotation(1);
+                    }
                     drawClock(false);  // partial refresh from wake
                 }
                 // Quick flight check: 1 BMP reading
@@ -952,7 +988,7 @@ void loop() {
         }
         // UP → stop flight, back to clock
         if (press[2]) {
-            if(vTaskH) { vTaskDelete(vTaskH); vTaskH = NULL; }
+            if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
             ledcWrite(BUZZER_PIN, 0);
@@ -961,9 +997,14 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        // OK → stop flight, show stats
+        // OK → stop flight, show stats (power down sensors, stop task)
         if (press[1]) {
             stopwatchElapsed += (now - data.tStart) / 1000;
+            if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
+            digitalWrite(PIN_VARIO_EN, 0);
+            digitalWrite(PIN_VIBRO, 0);
+            ledcWrite(BUZZER_PIN, 0);
+            vfsm.reset();
             fsm.state = FSM_STOPPED;
             digitalWrite(PIN_VIBRO, 0);
             return;
@@ -978,7 +1019,7 @@ void loop() {
                 if (vfsm.lastActivity == 0) vfsm.lastActivity = now;
                 if ((now - vfsm.lastActivity) > (LANDING_DETECT_SEC * 1000UL)) {
                     stopwatchElapsed += (now - data.tStart) / 1000;
-                    if(vTaskH) { vTaskDelete(vTaskH); vTaskH = NULL; }
+                    if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
                     digitalWrite(PIN_VARIO_EN, 0);
                     digitalWrite(PIN_VIBRO, 0);
                     ledcWrite(BUZZER_PIN, 0);
@@ -1004,7 +1045,7 @@ void loop() {
     case FSM_STOPPED:
         // STOPPED: flight timer frozen, stats displayed. UP=exit, OK=reset RTC, DOWN=restart.
         if (press[2]) { // UP → clock
-            if(vTaskH) { vTaskDelete(vTaskH); vTaskH = NULL; }
+            if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
             ledcWrite(BUZZER_PIN, 0);
