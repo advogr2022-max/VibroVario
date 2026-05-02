@@ -1,4 +1,4 @@
-/* Version 1.5b — English cross-reference comments, FSM transition docs
+/* Version 1.6 — Core 2.0.17 compat, Watchy pin cleanup
  * ESP32 Variometer firmware
  * Fork/port of original VibroVario (github.com/isemaster/VibroVario)
  * Main features:
