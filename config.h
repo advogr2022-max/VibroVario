@@ -55,6 +55,7 @@ constexpr int PIN_BATT = 34;                       // Battery ADC pin
 
 // --- BUZZER (Brauneiger-style) ---
 constexpr int BUZZER_PIN = 32;                     // Buzzer PWM pin
+constexpr uint8_t BUZZER_CHANNEL = 0;              // LEDC channel (Core 2.x: channel != pin)
 
 // Tone settings (Brauneiger IQ style)
 constexpr float BZ_SILENT_MIN = -0.3f;             // Silent zone lower bound (m/s)
@@ -75,7 +76,11 @@ constexpr int EPD_DC = 10;                         // E-Ink data/command
 constexpr int EPD_BUSY = 19;                       // E-Ink busy
 constexpr uint8_t ADDR_BMA = 0x18;                 // BMA423 I2C address
 constexpr uint8_t ADDR_RTC = 0x51;                 // PCF8563 RTC I2C address
+#ifndef ACC_INT_1_PIN
 constexpr int ACC_INT_1_PIN = 14;                  // BMA423 INT1 (any-motion wake)
+#endif
+#ifndef RTC_INT_PIN
 constexpr int RTC_INT_PIN = 27;                    // PCF8563 INT (alarm wake)
+#endif
 
 #endif // CONFIG_H

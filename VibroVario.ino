@@ -386,10 +386,10 @@ void varioTask(void *p) {
                             vfsm.bzOn = !vfsm.bzOn;
                             vfsm.bzNextT = bzNow + beatMs / 2;
                             if (vfsm.bzOn) {
-                                ledcChangeFrequency(BUZZER_PIN, freq, 8);
-                                ledcWrite(BUZZER_PIN, 128);
+                                ledcChangeFrequency(BUZZER_CHANNEL, freq, 8);
+                                ledcWrite(BUZZER_CHANNEL, 128);
                             } else {
-                                ledcWrite(BUZZER_PIN, 0);
+                                ledcWrite(BUZZER_CHANNEL, 0);
                             }
                         }
                     } else if (bzV <= BZ_SILENT_MIN) {
@@ -397,8 +397,8 @@ void varioTask(void *p) {
                         if (sinkRate > 5.0f) sinkRate = 5.0f;
                         int freq = BZ_SINK_FREQ;
                         if (sinkRate >= (-BZ_SINK_ALARM)) {
-                            ledcChangeFrequency(BUZZER_PIN, freq, 8);
-                            ledcWrite(BUZZER_PIN, 128);
+                            ledcChangeFrequency(BUZZER_CHANNEL, freq, 8);
+                            ledcWrite(BUZZER_CHANNEL, 128);
                             vfsm.bzOn = true;
                             vfsm.bzNextT = 0;
                         } else {
@@ -408,19 +408,19 @@ void varioTask(void *p) {
                                 vfsm.bzOn = !vfsm.bzOn;
                                 vfsm.bzNextT = bzNow + beatMs / 2;
                                 if (vfsm.bzOn) {
-                                    ledcChangeFrequency(BUZZER_PIN, freq, 8);
-                                    ledcWrite(BUZZER_PIN, 128);
+                                    ledcChangeFrequency(BUZZER_CHANNEL, freq, 8);
+                                    ledcWrite(BUZZER_CHANNEL, 128);
                                 } else {
-                                    ledcWrite(BUZZER_PIN, 0);
+                                    ledcWrite(BUZZER_CHANNEL, 0);
                                 }
                             }
                         }
                     } else {
-                        if (vfsm.bzOn) { ledcWrite(BUZZER_PIN, 0); vfsm.bzOn = false; }
+                        if (vfsm.bzOn) { ledcWrite(BUZZER_CHANNEL, 0); vfsm.bzOn = false; }
                         vfsm.bzNextT = 0;
                     }
                 } else {
-                    if (vfsm.bzOn) { ledcWrite(BUZZER_PIN, 0); vfsm.bzOn = false; }
+                    if (vfsm.bzOn) { ledcWrite(BUZZER_CHANNEL, 0); vfsm.bzOn = false; }
                     vfsm.bzNextT = 0;
                 }
                 // BMP fail detection
@@ -439,7 +439,7 @@ void varioTask(void *p) {
             }
         } else {
             digitalWrite(PIN_VIBRO, 0);
-            ledcWrite(BUZZER_PIN, 0);
+            ledcWrite(BUZZER_CHANNEL, 0);
         }
 
         esp_task_wdt_reset();
@@ -1196,8 +1196,8 @@ void goDeepSleep() {
     fsmStateRTC = fsm.state;
     if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
     digitalWrite(PIN_VARIO_EN, 0); digitalWrite(PIN_VIBRO, 0);
-    ledcWrite(BUZZER_PIN, 0);
-    ledcDetach(BUZZER_PIN);
+    ledcWrite(BUZZER_CHANNEL, 0);
+    ledcDetachPin(BUZZER_PIN);
     display.hibernate(); Wire.end(); WiFi.mode(WIFI_OFF);
 
     // Wake sources: BTN_UP, BTN_OK, BTN_DOWN, RTC alarm, BMA motion
@@ -1223,8 +1223,9 @@ void setup() {
     digitalWrite(PIN_VIBRO, 0);
 
     // Initialize buzzer (PWM) — ESP32 Core 3.x API
-    ledcAttach(BUZZER_PIN, BZ_CLIMB_BASE, 8);  // pin IS the channel in Core 3.x
-    ledcWrite(BUZZER_PIN, 0);                   // silent at startup
+    ledcSetup(BUZZER_CHANNEL, BZ_CLIMB_BASE, 8);             // Core 2.x: setup channel
+    ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);                // then attach pin to channel
+    ledcWrite(BUZZER_CHANNEL, 0);                   // silent at startup
 
     Wire.begin();
     setCpuFrequencyMhz(80);
@@ -1232,14 +1233,9 @@ void setup() {
 
     readRTC();
 
-    // Init watchdog: 10 second timeout, panic on expiry
-    esp_task_wdt_config_t wdtConfig = {
-        .timeout_ms = 10000,
-        .idle_core_mask = 0,
-        .trigger_panic = true
-    };
-    esp_task_wdt_init(&wdtConfig);
-    esp_task_wdt_add(NULL);  // subscribe loop() task (core 1)
+    // Init watchdog: 10 second timeout, panic on expiry (Core 2.x API)
+    esp_task_wdt_init(10, true);                     // timeout in seconds, panic on expiry
+    esp_task_wdt_add(NULL);                          // subscribe loop() task (core 1)
 
     initTracker();  // init flight log ring buffer on flash
 
@@ -1516,7 +1512,7 @@ void loop() {
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
-            ledcWrite(BUZZER_PIN, 0);
+            ledcWrite(BUZZER_CHANNEL, 0);
             vfsm.reset();
             readRTC(); drawClock(true);
             fsm.state = FSM_CLOCK;
@@ -1528,7 +1524,7 @@ void loop() {
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
-            ledcWrite(BUZZER_PIN, 0);
+            ledcWrite(BUZZER_CHANNEL, 0);
             vfsm.reset();
             fsm.state = FSM_STOPPED;
             digitalWrite(PIN_VIBRO, 0);
@@ -1551,7 +1547,7 @@ void loop() {
                         if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
                         digitalWrite(PIN_VARIO_EN, 0);
                         digitalWrite(PIN_VIBRO, 0);
-                        ledcWrite(BUZZER_PIN, 0);
+                        ledcWrite(BUZZER_CHANNEL, 0);
                         vfsm.reset();
                         readRTC(); drawClock(true);
                         fsm.state = FSM_CLOCK;
@@ -1578,7 +1574,7 @@ void loop() {
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
-            ledcWrite(BUZZER_PIN, 0);
+            ledcWrite(BUZZER_CHANNEL, 0);
             vfsm.reset();
             readRTC(); drawClock(true);
             fsm.state = FSM_CLOCK;
