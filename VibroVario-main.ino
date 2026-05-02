@@ -517,6 +517,13 @@ void drawClock(bool fullInit) {
         drawItem(-1, 110, &FreeSansBold24pt7b, buf);
         sprintf(buf, "%02d.%02d", rtc_d, rtc_mon);
         drawItem(-1, 160, &FreeSansBold18pt7b, buf);
+
+        // Button labels in corners (tiny 9pt)
+        display.setFont(&FreeSansBold9pt7b);
+        display.setCursor(2, 10);   display.print("1");  // top-left: MENU
+        display.setCursor(188, 10); display.print("2");  // top-right: UP
+        display.setCursor(2, 196);  display.print("3");  // bottom-left: OK
+        display.setCursor(188, 196);display.print("4");  // bottom-right: DOWN (settings)
     } while (display.nextPage());
 }
 
@@ -1395,8 +1402,8 @@ void loop() {
         }
         // No button → motion logic + deep sleep
         if (!anyBtn) {
-            // Stay awake at least 3s on cold boot so user can press a button
-            if (millis() < 3000) { return; }
+            // Stay awake 15s after wake so user can press a button for settings
+            if (millis() < 15000) { return; }
 
             bool hadMotion = false;
             uint64_t pin = 0;
