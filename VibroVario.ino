@@ -103,7 +103,8 @@ RTC_DATA_ATTR float altCheck = 0.0f;                     // Last altitude for au
 RTC_DATA_ATTR unsigned long motionTime = 0;              // Motion wake counter (RTC)
 RTC_DATA_ATTR bool buzzerEnabled = true;                 // Buzzer enabled (RTC)
 RTC_DATA_ATTR bool vibroEnabled = true;                  // Vibro enabled (RTC)
-RTC_DATA_ATTR float userQNH = 1013.25f;                  // User-set QNH (RTC)
+RTC_DATA_ATTR float userQNH = 1013.25f;             // User-set QNH (RTC)
+RTC_DATA_ATTR int userAltM = 0;                     // User field elevation in meters (RTC)
 
 // Variometer task state machine — replaces all static locals
 struct VarioFsm {
@@ -687,12 +688,12 @@ void drawSettings() {
         else sprintf(buf, "%02d:%02d", rtc_h, rtc_m);
         display.println(buf);
 
-        // Row 3: QNH
+        // Row 3: Alt (elevation → auto QNH)
         display.setCursor(10, 125);
         display.print(fsm.settingsRow == 3 ? ">" : " ");
-        display.print("QNH:    ");
-        if (fsm.editPhase >= 1) sprintf(buf, "%.1f_", userQNH);
-        else sprintf(buf, "%.1f", userQNH);
+        display.print("Alt:    ");
+        if (fsm.editPhase >= 1) sprintf(buf, "%dm_", userAltM);
+        else sprintf(buf, "%dm", userAltM);
         display.println(buf);
 
         drawItem(-1, 170, &FreeSansBold9pt7b,
@@ -710,6 +711,28 @@ void writeTimeToRTC(int h, int m) {
     Wire.write(bcdM); // minutes
     Wire.write(bcdH); // hours
     Wire.endTransmission();
+}
+
+// Read BMP pressure and compute QNH for given field elevation (meters).
+// Uses standard atmosphere reverse formula: QNH = P / (1 - h/44330.769)^5.255876
+void computeQNHfromAlt(int altMeters) {
+    digitalWrite(PIN_VARIO_EN, 1);
+    delay(10);
+    if (bmp.begin_I2C(0x77) || bmp.begin_I2C(0x76)) {
+        bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+        bmp.setPressureOversampling(BMP3_OVERSAMPLING_2X);
+        bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+        if (bmp.performReading()) {
+            float pAbs = bmp.pressure / 100.0f; // Pa to hPa
+            float ratio = 1.0f - altMeters / 44330.769f;
+            if (ratio > 0.01f) {
+                userQNH = pAbs / powf(ratio, 5.255876f);
+                if (userQNH < 950.0f) userQNH = 950.0f;
+                if (userQNH > 1050.0f) userQNH = 1050.0f;
+            }
+        }
+    }
+    digitalWrite(PIN_VARIO_EN, 0);
 }
 
 void startFlight() {
@@ -1063,8 +1086,8 @@ void loop() {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 1) % 24;
                     else rtc_m = (rtc_m + 1) % 60;
                 } else if (fsm.settingsRow == 3) {
-                    userQNH += 0.1f;
-                    if (userQNH > 1050.0f) userQNH = 1050.0f;
+                    userAltM += 10;
+                    if (userAltM > 5000) userAltM = 5000;
                 }
                 drawSettings(); return;
             }
@@ -1073,16 +1096,19 @@ void loop() {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 23) % 24;
                     else rtc_m = (rtc_m + 59) % 60;
                 } else if (fsm.settingsRow == 3) {
-                    userQNH -= 0.1f;
-                    if (userQNH < 950.0f) userQNH = 950.0f;
+                    userAltM -= 10;
+                    if (userAltM < 0) userAltM = 0;
                 }
                 drawSettings(); return;
             }
-            if (press[1]) { // OK → save and advance/exit
+            if (press[1]) { // OK → save and compute QNH
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) fsm.editPhase = 2;
                     else { writeTimeToRTC(rtc_h, rtc_m); fsm.editPhase = 0; }
-                } else { fsm.editPhase = 0; }
+                } else {
+                    computeQNHfromAlt(userAltM);
+                    fsm.editPhase = 0;
+                }
                 drawSettings(); return;
             }
             delay(50); break;
