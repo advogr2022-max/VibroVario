@@ -1347,19 +1347,21 @@ void setup() {
 void loop() {
     esp_task_wdt_reset();
     // === FSM TICK ===
-    bool btn[3] = { digitalRead(BTN_DOWN), digitalRead(BTN_OK), digitalRead(BTN_UP) };
+    // Watchy buttons: active LOW (pullup, pressed = GND = LOW)
+    bool btn[3] = { !digitalRead(BTN_DOWN), !digitalRead(BTN_OK), !digitalRead(BTN_UP) };
+    // btn[x]=true means button IS pressed, false = not pressed (inverted from pin level)
     bool anyBtn = btn[0] || btn[1] || btn[2];
     unsigned long now = millis();
 
     // Rising-edge detection with 50ms debounce delay.
     // fsm.lastBtn stores previous state for edge comparison.
     // Index mapping: [0]=DOWN, [1]=OK, [2]=UP.
-    // Debounce: detection on rising edge
+    // Debounce: detection on rising edge (0→1 in btn[] which is !digitalRead)
     bool press[3] = { false, false, false };
     for (int i = 0; i < 3; i++) {
         if (btn[i] && !fsm.lastBtn[i]) {
             delay(50);
-            if (digitalRead(i == 0 ? BTN_DOWN : (i == 1 ? BTN_OK : BTN_UP))) {
+            if (!digitalRead(i == 0 ? BTN_DOWN : (i == 1 ? BTN_OK : BTN_UP))) {
                 press[i] = true;
             }
         }
@@ -1394,6 +1396,9 @@ void loop() {
         }
         // No button → motion logic + deep sleep
         if (!anyBtn) {
+            // Stay awake at least 3s on cold boot so user can press a button
+            if (millis() < 3000) { return; }
+
             bool hadMotion = false;
             uint64_t pin = 0;
             esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
