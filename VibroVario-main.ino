@@ -135,6 +135,11 @@ VarioEMA varioEMA;
 bool showTestResult = false;                         // Flag: display test result on settings screen
 String testResult;                                   // Last self-test result text
 
+// Web export globals — must be declared before drawSettings() which uses them
+WiFiServer webServer(80);
+unsigned long webExportStartTime = 0;
+bool webExportActive = false;
+
 // Read altitude using user-set QNH. Wraps BMP library call.
 float readAlt() { return bmp.readAltitude(userQNH); }
 
@@ -896,9 +901,6 @@ void logRecord() {
 }
 
 // --- WEB EXPORT ---
-WiFiServer webServer(80);
-unsigned long webExportStartTime = 0;
-bool webExportActive = false;
 
 // Scan ring buffer and extract flight list (up to maxFlights).
 // Returns number of flights found.
