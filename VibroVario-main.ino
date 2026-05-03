@@ -157,7 +157,7 @@ uint8_t bcd2dec(uint8_t v) { return ((v/16*10) + (v%16)); }
 
 void readRTC() {
   Wire.beginTransmission(ADDR_RTC); Wire.write(0x02); Wire.endTransmission();
-  Wire.requestFrom(ADDR_RTC, 7);
+  Wire.requestFrom((uint8_t)ADDR_RTC, (uint8_t)7);
   if(Wire.available()) {
      rtc_s = bcd2dec(Wire.read() & 0x7F);
      rtc_m = bcd2dec(Wire.read() & 0x7F);
@@ -175,7 +175,7 @@ void readRTC() {
 // Setting minute alarm with 0x80 bit = match only minutes, ignore seconds.
 void setRTCAlarmSec(int secFromNow) {
   Wire.beginTransmission(ADDR_RTC); Wire.write(0x02); Wire.endTransmission();
-  Wire.requestFrom(ADDR_RTC, 6);
+  Wire.requestFrom((uint8_t)ADDR_RTC, (uint8_t)6);
   uint8_t s=0, m=0, h=0, d=0, wd=0, mon=0;
   if(Wire.available()) {
      s = Wire.read() & 0x7F;  // seconds
@@ -211,7 +211,7 @@ void setRTCAlarmSec(int secFromNow) {
   Wire.endTransmission();
   // Enable alarm interrupt in control/status1
   Wire.beginTransmission(ADDR_RTC); Wire.write(0x00); Wire.endTransmission();
-  Wire.requestFrom(ADDR_RTC, 1);
+  Wire.requestFrom((uint8_t)ADDR_RTC, (uint8_t)1);
   uint8_t cs1 = 0;
   if(Wire.available()) cs1 = Wire.read();
   Wire.beginTransmission(ADDR_RTC); Wire.write(0x00);
@@ -251,7 +251,7 @@ void initSensors() {
     // Verify BMA423 presence: chip ID register 0x00 should be 0x11
     Wire.beginTransmission(ADDR_BMA); Wire.write(0x00);
     if (Wire.endTransmission() == 0) {
-        Wire.requestFrom(ADDR_BMA, 1);
+        Wire.requestFrom((uint8_t)ADDR_BMA, (uint8_t)1);
         data.accInit = Wire.available() && (Wire.read() == 0x11);
     }
 }
@@ -285,7 +285,7 @@ void varioTask(void *p) {
 
             if (data.accInit && accSafe) {
                 Wire.beginTransmission(ADDR_BMA); Wire.write(0x12); Wire.endTransmission();
-                Wire.requestFrom(ADDR_BMA, 6);
+                Wire.requestFrom((uint8_t)ADDR_BMA, (uint8_t)6);
                 if (Wire.available() >= 6) {
                     int16_t rx = Wire.read() | (Wire.read() << 8);
                     int16_t ry = Wire.read() | (Wire.read() << 8);
@@ -673,7 +673,7 @@ void startFlight() {
         for(int i=0; i<samples; i++) {
             float _ax = 0.0f, _ay = 0.0f, _az = 0.0f;
             Wire.beginTransmission(ADDR_BMA); Wire.write(0x12); Wire.endTransmission();
-            Wire.requestFrom(ADDR_BMA, 6);
+            Wire.requestFrom((uint8_t)ADDR_BMA, (uint8_t)6);
             if(Wire.available()>=6) {
                 int16_t rx = Wire.read()|(Wire.read()<<8);
                 int16_t ry = Wire.read()|(Wire.read()<<8);
@@ -741,7 +741,7 @@ void runSelfTest() {
     }
     Wire.beginTransmission(ADDR_BMA); Wire.write(0x00);
     if (Wire.endTransmission() == 0) {
-        Wire.requestFrom(ADDR_BMA, 1);
+        Wire.requestFrom((uint8_t)ADDR_BMA, (uint8_t)1);
         accOK = Wire.available() && (Wire.read() == 0x11);
     }
     digitalWrite(PIN_VARIO_EN, 0);
@@ -807,7 +807,7 @@ String runSelfTestStr() {
     }
     Wire.beginTransmission(ADDR_BMA); Wire.write(0x00);
     if (Wire.endTransmission() == 0) {
-        Wire.requestFrom(ADDR_BMA, 1);
+        Wire.requestFrom((uint8_t)ADDR_BMA, (uint8_t)1);
         accOK = Wire.available() && (Wire.read() == 0x11);
     }
     digitalWrite(PIN_VARIO_EN, 0);
