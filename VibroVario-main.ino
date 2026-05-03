@@ -463,6 +463,13 @@ void drawMain() {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
 
+        // Corner labels (same as clock screen)
+        display.setFont(&FreeSansBold9pt7b);
+        display.setCursor(2, 10);   display.print("ex");  // exit (BTN4)
+        display.setCursor(188, 15); display.print("^");   // confirm (BTN2)
+        display.setCursor(2, 196);  display.print("ok");  // down (BTN1)
+        display.setCursor(188, 196);display.print("v");   // back (BTN3)
+
         // Flight time
         unsigned long t = stopwatchElapsed + (fsmStateRTC == FSM_RUNNING ? (millis()-data.tStart)/1000 : 0);
         sprintf(buf, "%02lu:%02lu:%02lu", t/3600, (t%3600)/60, t%60);
@@ -580,7 +587,7 @@ void drawSettings() {
         display.setCursor(10, 130);
         display.print(fsm.settingsRow == 4 ? ">" : " ");
         display.print("WiFi:   ");
-        display.println("[OFF]");
+        display.println(webExportActive ? "[ON]" : "[OFF]");
 
         // Row 5: Sensitivity
         display.setCursor(10, 150);
@@ -957,6 +964,14 @@ void drawWebExport() {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
+
+        // Corner labels (same as clock screen)
+        display.setFont(&FreeSansBold9pt7b);
+        display.setCursor(2, 10);   display.print("ex");  // exit (BTN4/UP)
+        display.setCursor(188, 15); display.print("^");   // (BTN2 — no-op)
+        display.setCursor(2, 196);  display.print("ok");  // (BTN1 — no-op)
+        display.setCursor(188, 196);display.print("v");   // exit (BTN3/BACK)
+
         drawItem(-1, 12, &FreeSansBold18pt7b, "WiFi Export");
         drawItem(-1, 38, &FreeSansBold9pt7b, "SSID: VibroVario");
         drawItem(-1, 55, &FreeSansBold9pt7b, "IP: 192.168.4.1");
@@ -968,7 +983,6 @@ void drawWebExport() {
         drawItem(-1, 100, &FreeSansBold9pt7b, "Open browser to 192.168.4.1");
         drawItem(-1, 120, &FreeSansBold9pt7b, "/export   - CSV all flights");
         drawItem(-1, 140, &FreeSansBold9pt7b, "/settings - set time/alt");
-        drawItem(-1, 175, &FreeSansBold9pt7b, "UP - exit");
     } while (display.nextPage());
 }
 
@@ -1461,6 +1475,7 @@ void loop() {
             if (fsm.settingsRow == 3) { fsm.editPhase = 1; drawSettings(); return; }
             if (fsm.settingsRow == 4) {
                 fsm.state = FSM_WEB_EXPORT;
+                startWebExport();
                 return;
             }
             if (fsm.settingsRow == 5) { fsm.editPhase = 3; drawSettings(); return; }
@@ -1616,7 +1631,8 @@ void loop() {
             return;
         }
         // BACK (press[2], BTN3/bottom-right) → exit early
-        if (press[2]) {
+        // UP (press[3], BTN4/top-left) → exit early (matches "UP - exit" on screen)
+        if (press[2] || press[3]) {
             webExportActive = false;
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_OFF);
