@@ -45,15 +45,20 @@ constexpr int V_GAP    = 100;                      // Gap between pulses in a bu
 constexpr int V_PAUSE  = 500;                      // Long pause between bursts (ms)
 constexpr int VIBRO_COOLDOWN_MS = 200;             // Cooldown after vibration before accel read
 
-// --- GPIO PINS ---
-// Button 1: GPIO 26 = OK (confirm/enter) — was PIN_VARIO_EN
-// Button 2: GPIO 25 = UP (navigation up)
-// Button 3: GPIO  4 = EDIT (change value)
-// Button 4: GPIO 35 = DOWN (navigation down)
-constexpr int BTN_OK = 26;                          // Button 1: confirm/enter
-constexpr int BTN_EDIT = 4;                         // Button 3: change value
-constexpr int BTN_UP = 25;                          // Button 2: navigation up
-constexpr int BTN_CALIBRATE = 35;                   // Button 4 (screen label "4"): start flight (also used as "down" in settings)
+// --- BUTTON MAPPING (physical numbering) ---
+// Button 1: GPIO 26 (bottom-left, OK/confirm)
+// Button 2: GPIO 25 (top-right, UP)
+// Button 3: GPIO 35 (bottom-right, DOWN/start flight)
+// Button 4: GPIO 4  (top-left, EDIT)
+constexpr int BTN1 = 26;
+constexpr int BTN2 = 25;
+constexpr int BTN3 = 35;
+constexpr int BTN4 = 4;
+// Legacy aliases (logical function names)
+constexpr int BTN_OK = BTN1;
+constexpr int BTN_UP = BTN2;
+constexpr int BTN_CALIBRATE = BTN3;
+constexpr int BTN_EDIT = BTN4;
 constexpr int PIN_VARIO_EN = 33;                   // Dummy pin — BMP not connected
 constexpr int PIN_VIBRO = 13;                      // Vibration motor pin
 constexpr int PIN_BATT = 34;                       // Battery ADC pin

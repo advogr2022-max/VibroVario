@@ -114,6 +114,12 @@ struct FsmRuntime {
     int editPhase;         // 0=idle, 1=editing hours/high byte, 2=editing minutes/low byte, 3=editing sensitivity
 } fsm;
 
+// === DEBUG: button number overlay (top-right corner, 5s) ===
+// TODO: remove after button mapping is confirmed working
+RTC_DATA_ATTR int debugBtnNum = 0;             // 1-4, 0=none
+RTC_DATA_ATTR unsigned long debugBtnTime = 0;  // millis() when pressed
+// === END DEBUG ===
+
 VarioFsm vfsm;
 
 struct SysData {
@@ -523,11 +529,25 @@ void drawClock(bool fullInit) {
 
         // Button labels in corners (tiny 9pt)
         display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(2, 10);   display.print("3");  // EDIT (GPIO4)
-        display.setCursor(188, 10); display.print("4");  // UP (GPIO25)
-        display.setCursor(2, 196);  display.print("2");  // OK (GPIO26)
-        display.setCursor(188, 196);display.print("1");  // CALIBRATE (GPIO35)
+        display.setCursor(2, 10);   display.print("4");  // BTN4 (GPIO4, top-left)
+        display.setCursor(188, 10); display.print("2");  // BTN2 (GPIO25, top-right)
+        display.setCursor(2, 196);  display.print("1");  // BTN1 (GPIO26, bottom-left)
+        display.setCursor(188, 196);display.print("3");  // BTN3 (GPIO35, bottom-right)
     } while (display.nextPage());
+}
+
+// === DEBUG: draw pressed button number in top-right corner ===
+// TODO: remove after button mapping is confirmed working
+void drawDebugBtn() {
+    if (!debugBtnNum || millis() - debugBtnTime > 5000) { debugBtnNum = 0; return; }
+    display.setPartialWindow(180, 0, 20, 15);
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setFont(&FreeSansBold9pt7b);
+        display.setCursor(183, 11);
+        display.print(debugBtnNum);
+    } while(display.nextPage());
 }
 
 void drawSettings() {
@@ -596,7 +616,7 @@ void drawSettings() {
         }
 
         drawItem(-1, 190, &FreeSansBold9pt7b,
-            fsm.editPhase > 0 ? "PRESS3=+  PRESS4=-  OK=save" : "PRESS4=down  PRESS2=back  OK=sel");
+            fsm.editPhase > 0 ? "PRESS2=+  PRESS4=+  PRESS1=save" : "PRESS3=down  PRESS2=back  PRESS1=sel");
     } while (display.nextPage());
 }
 
@@ -1347,8 +1367,8 @@ void loop() {
     esp_task_wdt_reset();
     // === FSM TICK ===
     // Buttons: active HIGH (default LOW=0, pressed HIGH=1)
-    // [0]=DOWN (GPIO35), [1]=OK (GPIO26), [2]=UP (GPIO25), [3]=EDIT (GPIO4)
-    bool btn[4] = { digitalRead(BTN_CALIBRATE), digitalRead(BTN_OK), digitalRead(BTN_UP), digitalRead(BTN_EDIT) };
+    // [0]=BTN1 (GPIO26), [1]=BTN2 (GPIO25), [2]=BTN3 (GPIO35), [3]=BTN4 (GPIO4)
+    bool btn[4] = { digitalRead(BTN1), digitalRead(BTN2), digitalRead(BTN3), digitalRead(BTN4) };
     bool anyBtn = btn[0] || btn[1] || btn[2] || btn[3];
     unsigned long now = millis();
 
@@ -1357,34 +1377,40 @@ void loop() {
     for (int i = 0; i < 4; i++) {
         if (btn[i] && !fsm.lastBtn[i]) {
             delay(50);
-            int p = (i==0 ? BTN_CALIBRATE : (i==1 ? BTN_OK : (i==2 ? BTN_UP : BTN_EDIT)));
+            int p = (i==0 ? BTN1 : (i==1 ? BTN2 : (i==2 ? BTN3 : BTN4)));
             if (digitalRead(p)) { press[i] = true; }
         }
         fsm.lastBtn[i] = btn[i];
     }
 
+    // === DEBUG: show pressed button number in top-right corner ===
+    for (int i = 0; i < 4; i++) {
+        if (press[i]) { debugBtnNum = i + 1; debugBtnTime = millis(); drawDebugBtn(); break; }
+    }
+    // === END DEBUG ===
+
     // FSM dispatcher
     switch (fsm.state) {
 
     case FSM_CLOCK: {
-        // [0]=CALIBRATE (btn4/G35/label "4") → fly
-        // [1]=OK (btn1/G26/label "1") → settings
-        // [2]=UP (btn2/G25/label "2") → sleep
-        // [3]=EDIT (btn3/G4/label "3") → no-op
-        if (press[0]) {  // CALIBRATE → start flight
-            fsm.state = FSM_CALIBRATING;
-            startFlight();
-            return;
-        }
-        if (press[1]) {  // OK → settings
+        // [0]=BTN1 (G26/bottom-left) → settings
+        // [1]=BTN2 (G25/top-right) → sleep
+        // [2]=BTN3 (G35/bottom-right) → fly
+        // [3]=BTN4 (G4/top-left) → no-op
+        if (press[0]) {  // BTN1 → settings
             fsm.state = FSM_SETTINGS;
             fsm.settingsRow = 0; fsm.editPhase = 0;
             drawSettings();
             return;
         }
-        if (press[2]) {  // UP → sleep
+        if (press[1]) {  // BTN2 → sleep
             setRTCAlarmSec(CLOCK_SLEEP_STILL);
             goDeepSleep();
+        }
+        if (press[2]) {  // BTN3 → start flight
+            fsm.state = FSM_CALIBRATING;
+            startFlight();
+            return;
         }
         // No button → sleep after 15s idle
         if (!anyBtn) {
@@ -1403,8 +1429,8 @@ void loop() {
     case FSM_SETTINGS: {
         // Edit mode (time or QNH adjustment active)
         if (fsm.editPhase > 0) {
-            // EDIT (btn3, press[3]) or UP (btn2, press[2]) → increase
-            if (press[3] || press[2]) {
+            // BTN4 (press[3], top-left) or BTN2 (press[1], top-right) → increase
+            if (press[3] || press[1]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 1) % 24;
                     else rtc_m = (rtc_m + 1) % 60;
@@ -1416,8 +1442,8 @@ void loop() {
                 }
                 drawSettings(); return;
             }
-            // DOWN (btn4, press[0]) → decrease
-            if (press[0]) {
+            // BTN3 (press[2], bottom-right) → decrease
+            if (press[2]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 23) % 24;
                     else rtc_m = (rtc_m + 59) % 60;
@@ -1429,8 +1455,8 @@ void loop() {
                 }
                 drawSettings(); return;
             }
-            // OK (btn1, press[1]) → save
-            if (press[1]) {
+            // BTN1 (press[0], bottom-left) → save
+            if (press[0]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) fsm.editPhase = 2;
                     else { writeTimeToRTC(rtc_h, rtc_m); fsm.editPhase = 0; }
@@ -1446,7 +1472,7 @@ void loop() {
         }
 
         // Normal settings navigation
-        if (press[1]) { // OK (btn1) on current row
+        if (press[0]) { // BTN1 (bottom-left) → select current row
             if (fsm.settingsRow == 0) { buzzerEnabled = !buzzerEnabled; drawSettings(); return; }
             if (fsm.settingsRow == 1) { vibroEnabled = !vibroEnabled; drawSettings(); return; }
             if (fsm.settingsRow == 2) { fsm.editPhase = 1; drawSettings(); return; }
@@ -1463,12 +1489,12 @@ void loop() {
                 drawSettings(); return;
             }
         }
-        if (press[0]) { // DOWN (btn4) → next row
+        if (press[2]) { // BTN3 (bottom-right) → next row
             fsm.settingsRow = (fsm.settingsRow + 1) % 7;  // 0..6
             showTestResult = false;
             drawSettings(); return;
         }
-        if (press[2]) { // UP (btn2) → back to clock
+        if (press[1]) { // BTN2 (top-right) → back to clock
             readRTC(); drawClock(true);
             fsm.state = FSM_CLOCK;
             fsm.editPhase = 0;
@@ -1488,7 +1514,7 @@ void loop() {
 
     case FSM_RUNNING: {
         // RUNNING: varioTask is active on core 0, loop handles UI and auto-landing.
-        // UP = emergency stop, OK = pause+stats, DOWN = ignored.
+        // BTN2(press[1], top-right)=emergency stop, BTN1(press[0], bottom-left)=pause+stats, BTN3(press[2])=ignored.
         // Track flag enables max/min recording after 5s stabilization.
         // Ensure vario task exists
         if (!vTaskH) {
@@ -1496,8 +1522,8 @@ void loop() {
             drawClock(true);
             return;
         }
-        // UP → stop flight, back to clock
-        if (press[2]) {
+        // BTN2 (press[1], top-right) → stop flight, back to clock
+        if (press[1]) {
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
@@ -1507,8 +1533,8 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        // OK → stop flight, show stats (power down sensors, stop task)
-        if (press[1]) {
+        // BTN1 (press[0], bottom-left) → stop flight, show stats
+        if (press[0]) {
             stopwatchElapsed += (now - data.tStart) / 1000;
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
@@ -1558,8 +1584,9 @@ void loop() {
     }
 
     case FSM_STOPPED:
-        // STOPPED: flight timer frozen, stats displayed. UP=exit, OK=reset RTC, DOWN=restart.
-        if (press[2]) { // UP → clock
+        // STOPPED: flight timer frozen, stats displayed. BTN1(press[0])=reset RTC, BTN2(press[1])=clock, BTN3(press[2])=restart.
+        // BTN2 (press[1], top-right) → clock
+        if (press[1]) {
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
@@ -1569,7 +1596,8 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        if (press[1]) { // OK — reset RTC to 00:00
+        // BTN1 (press[0], bottom-left) → reset RTC to 00:00
+        if (press[0]) {
             i2cWrite(ADDR_RTC, 0x02, 0);
             i2cWrite(ADDR_RTC, 0x03, 0);
             i2cWrite(ADDR_RTC, 0x04, 0);
@@ -1578,7 +1606,7 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        if (press[0]) { // DOWN → new flight
+        if (press[2]) { // BTN3 (bottom-right) → new flight
             startFlight();
             return;
         }
@@ -1600,8 +1628,8 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        // UP → exit early
-        if (press[2]) {
+        // BTN2 (press[1], top-right) → exit early
+        if (press[1]) {
             webExportActive = false;
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_OFF);
