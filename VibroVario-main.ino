@@ -523,10 +523,10 @@ void drawClock(bool fullInit) {
 
         // Button labels in corners (tiny 9pt)
         display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(2, 10);   display.print("3");  // top-left
-        display.setCursor(188, 10); display.print("4");  // top-right
-        display.setCursor(2, 196);  display.print("2");  // bottom-left
-        display.setCursor(188, 196);display.print("1");  // bottom-right
+        display.setCursor(2, 10);   display.print("EX");  // exit
+        display.setCursor(188, 10); display.print("^");   // up
+        display.setCursor(2, 196);  display.print("OK");  // confirm
+        display.setCursor(188, 196);display.print("v");   // down
     } while (display.nextPage());
 }
 
@@ -536,7 +536,7 @@ void drawSettings() {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        drawItem(-1, 12, &FreeSansBold18pt7b, "Settings");
+        drawItem(-1, 17, &FreeSansBold18pt7b, "Settings");
 
         display.setFont(&FreeSansBold9pt7b);
         char buf[32];
