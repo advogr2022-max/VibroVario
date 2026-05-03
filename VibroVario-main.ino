@@ -136,7 +136,8 @@ bool showTestResult = false;                         // Flag: display test resul
 String testResult;                                   // Last self-test result text
 
 // Web export globals — must be declared before drawSettings() which uses them
-WiFiServer* webServer = NULL;
+// NOTE: WiFiServer must be global, constructed before WiFi init (proven pattern)
+WiFiServer webServer(80);
 unsigned long webExportStartTime = 0;
 bool webExportActive = false;
 
@@ -989,11 +990,11 @@ void drawWebExport() {
 
 void startWebExport() {
     WiFi.mode(WIFI_AP);
-    WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+    // NOTE: no softAPConfig! Default IP is 192.168.4.1, calling softAPConfig
+    // triggers AP_STOP → AP_START which breaks client connections.
     WiFi.softAP("VibroVario");
-    delay(500);  // give WiFi stack time to initialize
-    webServer = new WiFiServer(80);
-    webServer->begin();
+    delay(500);
+    webServer.begin();
     webExportStartTime = millis();
     webExportActive = true;
     drawWebExport();
@@ -1209,8 +1210,7 @@ void handleSet(WiFiClient &c, String &query) {
 }
 
 void handleWebClient() {
-    if (!webServer) return;
-    WiFiClient client = webServer->available();
+    WiFiClient client = webServer.available();
     if (!client) return;
 
     // Read request line with 2s timeout to prevent hanging on broken connections
@@ -1629,7 +1629,6 @@ void loop() {
         // Check 15-minute timeout
         if (webExportActive && (millis() - webExportStartTime > 15*60*1000UL)) {
             webExportActive = false;
-            delete webServer; webServer = NULL;
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_OFF);
             readRTC(); drawClock(true);
@@ -1640,7 +1639,6 @@ void loop() {
         // UP (press[3], BTN4/top-left) → exit early (matches "UP - exit" on screen)
         if (press[2] || press[3]) {
             webExportActive = false;
-            delete webServer; webServer = NULL;
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_OFF);
             readRTC(); drawClock(true);
