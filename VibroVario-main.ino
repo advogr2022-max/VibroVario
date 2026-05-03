@@ -906,6 +906,50 @@ void logRecord() {
     trackState.totalRecords++;
 }
 
+// Generate a 5-minute test flight (00:00:00 - 00:04:59) for download testing
+void createTestFlight() {
+    if (!trackPart) return;
+
+    // Init tracker if needed
+    if (trackState.magic != 0x54524B55) initTracker();
+
+    trackState.flightNum++;
+    // Use current date from RTC
+    readRTC();
+    trackState.flightStartDay = (uint8_t)rtc_d;
+    trackState.flightStartMon = (uint8_t)rtc_mon;
+    uint16_t date = ((uint16_t)rtc_d << 8) | (uint16_t)rtc_mon;
+
+    float alt = 100.0f;
+    for (int i = 0; i < 300; i++) {  // 5 min × 60 sec
+        TrackRecord rec;
+        rec.flightNum = trackState.flightNum;
+        rec.date = date;
+        rec.secSinceMidnight = (uint32_t)i;  // 00:00:00 + i seconds
+        rec.altM = (int16_t)roundf(alt);
+        rec.crc = crc16((const uint8_t*)&rec, 10);
+
+        if (trackState.writeOffset + sizeof(rec) > trackPart->size) {
+            trackState.writeOffset = 0;
+        }
+        uint16_t sector = trackState.writeOffset / 4096;
+        if (sector != trackState.lastEraseSector) {
+            size_t eraseOff = sector * 4096;
+            size_t eraseSz = 4096;
+            if (eraseOff + eraseSz > trackPart->size) {
+                eraseSz = trackPart->size - eraseOff;
+            }
+            esp_partition_erase_range(trackPart, eraseOff, eraseSz);
+            trackState.lastEraseSector = sector;
+        }
+        esp_partition_write(trackPart, trackState.writeOffset, &rec, sizeof(rec));
+        trackState.writeOffset += sizeof(rec);
+        trackState.totalRecords++;
+
+        alt += 0.1f;  // gradual climb 100→130m
+    }
+}
+
 // --- WEB EXPORT ---
 
 // Scan ring buffer and extract flight list (up to maxFlights).
@@ -1270,6 +1314,19 @@ void handleWebClient() {
             client.println("Connection: close");
             client.println();
         }
+        handled = true;
+    } else if (request.indexOf("GET /test-data") == 0) {
+        // Hidden endpoint: generate a test flight
+        createTestFlight();
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: text/html; charset=utf-8");
+        client.println("Connection: close");
+        client.println();
+        client.println("<!DOCTYPE html><html><body>");
+        client.println("<h2>Test flight created</h2>");
+        client.println("<p>5-minute flight recorded. <a href='/'>Go back</a></p>");
+        client.println("</body></html>");
+        client.stop();
         handled = true;
     } else if (request.indexOf("GET /stop") == 0) {
         client.println("HTTP/1.1 200 OK");
