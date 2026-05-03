@@ -594,9 +594,6 @@ void drawSettings() {
             display.setCursor(80, 170);
             display.println(testResult);
         }
-
-        drawItem(-1, 190, &FreeSansBold9pt7b,
-            fsm.editPhase > 0 ? "PRESS4=+  PRESS1=-  PRESS2=ok  PRESS3=back" : "PRESS1=down  PRESS2=sel  PRESS3=back");
     } while (display.nextPage());
 }
 
