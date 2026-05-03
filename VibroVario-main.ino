@@ -140,6 +140,7 @@ String testResult;                                   // Last self-test result te
 WiFiServer webServer(80);
 unsigned long webExportStartTime = 0;
 unsigned long lastWebActivity = 0;                // Last HTTP request time, for idle timeout
+unsigned long lastWebScreen = 0;                  // Last web screen refresh time
 bool webExportActive = false;
 
 // Read altitude using user-set QNH. Wraps BMP library call.
@@ -1008,7 +1009,6 @@ int scanFlights(FlightInfo *flights, int maxFlights) {
 }
 
 void drawWebExport() {
-    // Count flights on-screen
     FlightInfo flist[30];
     int nFlights = scanFlights(flist, 30);
 
@@ -1018,23 +1018,28 @@ void drawWebExport() {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
 
-        // Corner labels (same as clock screen)
+        // Corner labels
         display.setFont(&FreeSansBold9pt7b);
         display.setCursor(2, 10);   display.print("ex");  // exit (BTN4/UP)
         display.setCursor(188, 15); display.print("^");   // (BTN2 — no-op)
         display.setCursor(2, 196);  display.print("ok");  // (BTN1 — no-op)
         display.setCursor(188, 196);display.print("v");   // exit (BTN3/BACK)
 
-        drawItem(-1, 15, &FreeSansBold9pt7b, "SSID: VibroVario");
-        drawItem(-1, 32, &FreeSansBold9pt7b, "IP: 192.168.4.1");
         char buf[32];
-        int remain = (15*60 - (int)((millis() - webExportStartTime)/1000));
-        if (remain < 0) remain = 0;
-        sprintf(buf, "Timer: %02d:%02d  Flights: %d", remain/60, remain%60, nFlights);
-        drawItem(-1, 72, &FreeSansBold9pt7b, buf);
-        drawItem(-1, 100, &FreeSansBold9pt7b, "Open browser to 192.168.4.1");
-        drawItem(-1, 120, &FreeSansBold9pt7b, "/export   - CSV all flights");
-        drawItem(-1, 140, &FreeSansBold9pt7b, "/settings - set time/alt");
+        // Idle timeout remaining (10 min max)
+        unsigned long idleSec = (millis() - lastWebActivity) / 1000;
+        unsigned long remain = 600;
+        if (idleSec < 600) remain = 600 - idleSec;
+        else remain = 0;
+        sprintf(buf, "Timeout: %02lu:%02lu  Flights: %d", remain/60, remain%60, nFlights);
+        drawItem(-1, 15, &FreeSansBold9pt7b, buf);
+
+        drawItem(-1, 40, &FreeSansBold9pt7b, "SSID: VibroVario");
+        drawItem(-1, 58, &FreeSansBold9pt7b, "IP: 192.168.4.1");
+        drawItem(-1, 80, &FreeSansBold9pt7b, "Open browser");
+        drawItem(-1, 98, &FreeSansBold9pt7b, "192.168.4.1");
+        drawItem(-1, 120, &FreeSansBold9pt7b, "Set time and date");
+        drawItem(-1, 140, &FreeSansBold9pt7b, "Save flights");
     } while (display.nextPage());
 }
 
@@ -1047,6 +1052,7 @@ void startWebExport() {
     webServer.begin();
     webExportStartTime = millis();
     lastWebActivity = millis();
+    lastWebScreen = millis();
     webExportActive = true;
     drawWebExport();
 }
@@ -1732,6 +1738,11 @@ void loop() {
             readRTC(); drawClock(true);
             fsm.state = FSM_CLOCK;
             return;
+        }
+        // Refresh screen every 5 sec so timer counts down
+        if (now - lastWebScreen > 5000) {
+            lastWebScreen = now;
+            drawWebExport();
         }
         delay(10);
         break;
