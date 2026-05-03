@@ -114,12 +114,6 @@ struct FsmRuntime {
     int editPhase;         // 0=idle, 1=editing hours/high byte, 2=editing minutes/low byte, 3=editing sensitivity
 } fsm;
 
-// === DEBUG: button number overlay (top-right corner, 5s) ===
-// TODO: remove after button mapping is confirmed working
-RTC_DATA_ATTR int debugBtnNum = 0;             // 1-4, 0=none
-RTC_DATA_ATTR unsigned long debugBtnTime = 0;  // millis() when pressed
-// === END DEBUG ===
-
 VarioFsm vfsm;
 
 struct SysData {
@@ -534,20 +528,6 @@ void drawClock(bool fullInit) {
         display.setCursor(2, 196);  display.print("2");  // bottom-left
         display.setCursor(188, 196);display.print("1");  // bottom-right
     } while (display.nextPage());
-}
-
-// === DEBUG: draw pressed button number in top-right corner ===
-// TODO: remove after button mapping is confirmed working
-void drawDebugBtn() {
-    if (!debugBtnNum || millis() - debugBtnTime > 5000) { debugBtnNum = 0; return; }
-    display.setPartialWindow(180, 0, 20, 15);
-    display.firstPage();
-    do {
-        display.fillScreen(GxEPD_WHITE);
-        display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(183, 11);
-        display.print(debugBtnNum);
-    } while(display.nextPage());
 }
 
 void drawSettings() {
@@ -1382,12 +1362,6 @@ void loop() {
         }
         fsm.lastBtn[i] = btn[i];
     }
-
-    // === DEBUG: show pressed button number in top-right corner ===
-    for (int i = 0; i < 4; i++) {
-        if (press[i]) { debugBtnNum = i + 1; debugBtnTime = millis(); drawDebugBtn(); break; }
-    }
-    // === END DEBUG ===
 
     // FSM dispatcher
     switch (fsm.state) {
