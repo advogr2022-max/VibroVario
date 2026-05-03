@@ -529,10 +529,10 @@ void drawClock(bool fullInit) {
 
         // Button labels in corners (tiny 9pt)
         display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(2, 10);   display.print("4");  // BTN4 (GPIO4, top-left)
-        display.setCursor(188, 10); display.print("2");  // BTN2 (GPIO25, top-right)
-        display.setCursor(2, 196);  display.print("1");  // BTN1 (GPIO26, bottom-left)
-        display.setCursor(188, 196);display.print("3");  // BTN3 (GPIO35, bottom-right)
+        display.setCursor(2, 10);   display.print("3");  // top-left
+        display.setCursor(188, 10); display.print("4");  // top-right
+        display.setCursor(2, 196);  display.print("2");  // bottom-left
+        display.setCursor(188, 196);display.print("1");  // bottom-right
     } while (display.nextPage());
 }
 
