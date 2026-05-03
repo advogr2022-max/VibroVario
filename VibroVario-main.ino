@@ -616,15 +616,20 @@ void drawSettings() {
     } while (display.nextPage());
 }
 
-// Write hours+minutes to PCF8563 RTC in BCD format, seconds zeroed
-void writeTimeToRTC(int h, int m) {
+// Write hours+minutes+day+month to PCF8563 RTC in BCD format, seconds zeroed
+void writeDateTimeToRTC(int h, int m, int d, int mon) {
     uint8_t bcdH = ((h / 10) << 4) | (h % 10);
     uint8_t bcdM = ((m / 10) << 4) | (m % 10);
+    uint8_t bcdD = ((d / 10) << 4) | (d % 10);
+    uint8_t bcdMon = ((mon / 10) << 4) | (mon % 10);
     Wire.beginTransmission(ADDR_RTC);
     Wire.write(0x02); // seconds register
     Wire.write(0x00); // seconds = 0
     Wire.write(bcdM); // minutes
     Wire.write(bcdH); // hours
+    Wire.write(bcdD); // day
+    Wire.write(0x00); // weekday (unused)
+    Wire.write(bcdMon); // month
     Wire.endTransmission();
 }
 
@@ -1034,33 +1039,63 @@ void send_foot(WiFiClient &c) {
 }
 
 void handleRoot(WiFiClient &c) {
+    readRTC();
     send_http_ok(c);
     c.println("Content-Type: text/html; charset=utf-8");
     c.println();
-    send_head(c);
+    c.println("<!DOCTYPE html><html><head>");
+    c.println("<meta charset='utf-8'><meta name='viewport' content='width=device-width'>");
+    c.println("<style>body{font:14px/1.4 sans-serif;margin:16px;max-width:600px}");
+    c.println("a{color:#06f}th{text-align:left;padding:2px 6px}td{padding:2px 6px}");
+    c.println("input{font:14px;width:70px;margin:2px}");
+    c.println(".btn{display:inline-block;padding:6px 14px;background:#06f;color:#fff;text-decoration:none;border-radius:4px;margin:4px 2px}");
+    c.println(".btn-danger{background:#c33}");
+    c.println("hr{border:none;border-top:1px solid #ddd;margin:16px 0}");
+    c.println("h2{margin:4px 0}");
+    c.println("</style></head><body>");
+
+    char buf[256];
+
+    // === SETTINGS FORM: Time & Date ===
     c.println("<h2>VibroVario</h2>");
-    char buf[128];
-    int remain = (15*60 - (int)((millis() - webExportStartTime)/1000));
-    if (remain < 0) remain = 0;
-    sprintf(buf, "<p>Active: <b>%02d:%02d</b></p>", remain/60, remain%60);
+    c.println("<form action='/set' method='get' style='margin:8px 0'>");
+    sprintf(buf, "H: <input type='number' name='h' min='0' max='23' value='%d'>", rtc_h);
+    c.println(buf);
+    sprintf(buf, "M: <input type='number' name='m' min='0' max='59' value='%d'>", rtc_m);
+    c.println(buf);
+    sprintf(buf, "D: <input type='number' name='d' min='1' max='31' value='%d'>", rtc_d);
+    c.println(buf);
+    sprintf(buf, "Mon: <input type='number' name='mon' min='1' max='12' value='%d'>", rtc_mon);
+    c.println(buf);
+    c.println("<input type='submit' value='Save Time & Date' class='btn' style='border:none;cursor:pointer'>");
+    c.println("</form>");
+
+    // === SETTINGS FORM: Altitude ===
+    c.println("<form action='/set' method='get' style='margin:4px 0'>");
+    sprintf(buf, "Alt(m): <input type='number' name='alt' min='0' max='5000' value='%d'>  ", userAltM);
+    c.println(buf);
+    c.println("<input type='submit' value='Set Altitude' class='btn' style='border:none;cursor:pointer'>");
+    c.println("</form>");
+    sprintf(buf, "<p style='font-size:12px;color:#888'>QNH: %.2f hPa</p>", userQNH);
     c.println(buf);
 
-    c.println("<p><a class='btn' href='/export'>Download all flights (CSV)</a></p>");
+    c.println("<hr>");
 
-    // Flight table
+    // === FLIGHT TABLE ===
     FlightInfo flist[30];
     int nFlights = scanFlights(flist, 30);
     if (nFlights > 0) {
-        c.println("<table><tr><th>Flight</th><th>Date</th><th>Start</th><th>Duration</th><th>Points</th><th></th></tr>");
-        for (int i = nFlights - 1; i >= 0; i--) {  // newest first
+        c.println("<table><tr><th>#</th><th>Date</th><th>Takeoff</th><th>Landing</th><th>Dur</th><th></th></tr>");
+        for (int i = nFlights - 1; i >= 0; i--) {
             FlightInfo &f = flist[i];
             int day = f.day ? f.day : rtc_d;
             int mon = f.mon ? f.mon : rtc_mon;
-            char ts[9], dur[9];
-            fmtTime(ts, f.startSec);
+            char takeoff[9], landing[9], dur[9];
+            fmtTime(takeoff, f.startSec);
+            fmtTime(landing, f.endSec);
             fmtDuration(dur, f.startSec, f.endSec);
-            sprintf(buf, "<tr><td>%d</td><td>%02d.%02d</td><td>%s</td><td>%s</td><td>%d</td>",
-                    f.num, day, mon, ts, dur, f.recCount);
+            sprintf(buf, "<tr><td>%d</td><td>%02d.%02d</td><td>%s</td><td>%s</td><td>%s</td>",
+                    f.num, day, mon, takeoff, landing, dur);
             c.println(buf);
             sprintf(buf, "<td><a href='/export?f=%d'>CSV</a></td></tr>", f.num);
             c.println(buf);
@@ -1070,8 +1105,13 @@ void handleRoot(WiFiClient &c) {
         c.println("<p>No flights recorded.</p>");
     }
 
-    c.println("<hr><p><a href='/settings'>Settings: time & altitude</a></p>");
-    send_foot(c);
+    c.println("<hr>");
+
+    // === ACTION BUTTONS ===
+    c.println("<p><a class='btn' href='/export'>Download All CSV</a>");
+    c.println("<a class='btn btn-danger' href='/stop'>Stop Server &amp; Exit</a></p>");
+
+    c.println("</body></html>");
 }
 
 void handleExport(WiFiClient &c, int flightFilter) {
@@ -1136,75 +1176,43 @@ void handleExport(WiFiClient &c, int flightFilter) {
     if (r2_len) sendRange(r2_off, r2_len);
 }
 
-void handleSettings(WiFiClient &c) {
-    // Read current RTC time
-    readRTC();
-    send_http_ok(c);
-    c.println("Content-Type: text/html; charset=utf-8");
-    c.println();
-    send_head(c);
-    c.println("<h2>Settings</h2>");
-    c.println("<form action='/set' method='get'>");
-    char buf[128];
-
-    // Time
-    c.println("<h3>Clock</h3>");
-    sprintf(buf, "<p>Hour: <input type='number' name='h' min='0' max='23' value='%d'></p>", rtc_h);
-    c.println(buf);
-    sprintf(buf, "<p>Min:  <input type='number' name='m' min='0' max='59' value='%d'></p>", rtc_m);
-    c.println(buf);
-
-    // Altitude / QNH
-    c.println("<h3>Field Altitude (auto QNH)</h3>");
-    sprintf(buf, "<p>Alt (m): <input type='number' name='alt' min='0' max='5000' value='%d'></p>", userAltM);
-    c.println(buf);
-    sprintf(buf, "<p>Current QNH: %.2f hPa</p>", userQNH);
-    c.println(buf);
-
-    c.println("<p><input type='submit' value='Save'></p>");
-    c.println("</form>");
-    c.println("<p><a href='/'>Back</a></p>");
-    send_foot(c);
-}
-
 void handleSet(WiFiClient &c, String &query) {
-    // Parse GET parameters: ?h=14&m=30 or ?alt=300 or combination
-    int newH = -1, newM = -1, newAlt = -1;
-    int pos;
+    // Parse GET parameters: ?h=14&m=30&d=15&mon=5&alt=300
+    int newH = -1, newM = -1, newD = -1, newMon = -1, newAlt = -1;
+    int pos, amp;
 
-    pos = query.indexOf("h=");
-    if (pos >= 0) newH = query.substring(pos + 2).toInt();
-    // Check if there's a '&' after h value
-    int amp = query.indexOf('&', pos + 2);
-    if (amp > 0 && newH >= 0) newH = query.substring(pos + 2, amp).toInt();
+    auto getInt = [&](const char* param) -> int {
+        pos = query.indexOf(param);
+        if (pos < 0) return -1;
+        amp = query.indexOf('&', pos + strlen(param));
+        if (amp > 0) return query.substring(pos + strlen(param), amp).toInt();
+        return query.substring(pos + strlen(param)).toInt();
+    };
 
-    pos = query.indexOf("m=");
-    if (pos >= 0) {
-        amp = query.indexOf('&', pos + 2);
-        if (amp > 0) newM = query.substring(pos + 2, amp).toInt();
-        else newM = query.substring(pos + 2).toInt();
-    }
-
-    pos = query.indexOf("alt=");
-    if (pos >= 0) {
-        amp = query.indexOf('&', pos + 4);
-        if (amp > 0) newAlt = query.substring(pos + 4, amp).toInt();
-        else newAlt = query.substring(pos + 4).toInt();
-    }
+    newH = getInt("h=");
+    newM = getInt("m=");
+    newD = getInt("d=");
+    newMon = getInt("mon=");
+    newAlt = getInt("alt=");
 
     // Validate
     if (newH >= 0 && newH < 24 && newM >= 0 && newM < 60) {
-        writeTimeToRTC(newH, newM);
         rtc_h = newH; rtc_m = newM;
+    }
+    if (newD >= 1 && newD <= 31) rtc_d = newD;
+    if (newMon >= 1 && newMon <= 12) rtc_mon = newMon;
+    // Write all to RTC if any time or date value was provided
+    if ((newH >= 0 || newM >= 0 || newD >= 0 || newMon >= 0)) {
+        writeDateTimeToRTC(rtc_h, rtc_m, rtc_d, rtc_mon);
     }
     if (newAlt >= 0 && newAlt <= 5000) {
         userAltM = newAlt;
         computeQNHfromAlt(newAlt);
     }
 
-    // Redirect back to settings page
+    // Redirect back to root
     c.println("HTTP/1.1 303 See Other");
-    c.println("Location: /settings");
+    c.println("Location: /");
     c.println("Connection: close");
     c.println();
 }
@@ -1243,7 +1251,12 @@ void handleWebClient() {
         handleExport(client, flightFilter);
         handled = true;
     } else if (request.indexOf("GET /settings") == 0) {
-        handleSettings(client);
+        // Redirect /settings to root (everything is on one page now)
+        client.println("HTTP/1.1 303 See Other");
+        client.println("Location: /");
+        client.println("Connection: close");
+        client.println();
+        client.stop();
         handled = true;
     } else if (request.indexOf("GET /set") == 0) {
         int qPos = request.indexOf('?');
@@ -1257,6 +1270,18 @@ void handleWebClient() {
             client.println("Connection: close");
             client.println();
         }
+        handled = true;
+    } else if (request.indexOf("GET /stop") == 0) {
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: text/html; charset=utf-8");
+        client.println("Connection: close");
+        client.println();
+        client.println("<!DOCTYPE html><html><body>");
+        client.println("<h2>Server stopped</h2>");
+        client.println("<p>You can close this page and disconnect.</p>");
+        client.println("</body></html>");
+        client.stop();
+        webExportActive = false;
         handled = true;
     }
 
@@ -1455,7 +1480,7 @@ void loop() {
             if (press[1]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) fsm.editPhase = 2;
-                    else { writeTimeToRTC(rtc_h, rtc_m); fsm.editPhase = 0; }
+                    else { writeDateTimeToRTC(rtc_h, rtc_m, rtc_d, rtc_mon); fsm.editPhase = 0; }
                 } else if (fsm.settingsRow == 3) {
                     computeQNHfromAlt(userAltM);
                     fsm.editPhase = 0;
@@ -1626,15 +1651,6 @@ void loop() {
 
     case FSM_WEB_EXPORT: {
         handleWebClient();
-        // Check 15-minute timeout
-        if (webExportActive && (millis() - webExportStartTime > 15*60*1000UL)) {
-            webExportActive = false;
-            WiFi.softAPdisconnect(true);
-            WiFi.mode(WIFI_OFF);
-            readRTC(); drawClock(true);
-            fsm.state = FSM_CLOCK;
-            return;
-        }
         // BACK (press[2], BTN3/bottom-right) → exit early
         // UP (press[3], BTN4/top-left) → exit early (matches "UP - exit" on screen)
         if (press[2] || press[3]) {
