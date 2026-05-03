@@ -974,9 +974,8 @@ void drawWebExport() {
         display.setCursor(2, 196);  display.print("ok");  // (BTN1 — no-op)
         display.setCursor(188, 196);display.print("v");   // exit (BTN3/BACK)
 
-        drawItem(-1, 12, &FreeSansBold18pt7b, "WiFi Export");
-        drawItem(-1, 38, &FreeSansBold9pt7b, "SSID: VibroVario");
-        drawItem(-1, 55, &FreeSansBold9pt7b, "IP: 192.168.4.1");
+        drawItem(-1, 15, &FreeSansBold9pt7b, "SSID: VibroVario");
+        drawItem(-1, 32, &FreeSansBold9pt7b, "IP: 192.168.4.1");
         char buf[32];
         int remain = (15*60 - (int)((millis() - webExportStartTime)/1000));
         if (remain < 0) remain = 0;
@@ -990,7 +989,9 @@ void drawWebExport() {
 
 void startWebExport() {
     WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
     WiFi.softAP("VibroVario");
+    delay(100);  // give WiFi stack time to initialize
     webServer.begin();
     webExportStartTime = millis();
     webExportActive = true;
