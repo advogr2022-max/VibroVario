@@ -1026,20 +1026,21 @@ void drawWebExport() {
         display.setCursor(188, 196);display.print("v");   // exit (BTN3/BACK)
 
         char buf[32];
-        // Idle timeout remaining (10 min max)
-        unsigned long idleSec = (millis() - lastWebActivity) / 1000;
-        unsigned long remain = 600;
-        if (idleSec < 600) remain = 600 - idleSec;
-        else remain = 0;
-        sprintf(buf, "Timeout: %02lu:%02lu  Flights: %d", remain/60, remain%60, nFlights);
-        drawItem(-1, 15, &FreeSansBold9pt7b, buf);
-
         drawItem(-1, 40, &FreeSansBold9pt7b, "SSID: VibroVario");
         drawItem(-1, 58, &FreeSansBold9pt7b, "IP: 192.168.4.1");
         drawItem(-1, 80, &FreeSansBold9pt7b, "Open browser");
         drawItem(-1, 98, &FreeSansBold9pt7b, "192.168.4.1");
         drawItem(-1, 120, &FreeSansBold9pt7b, "Set time and date");
         drawItem(-1, 140, &FreeSansBold9pt7b, "Save flights");
+        // Idle timeout + flight count below
+        sprintf(buf, "Flights: %d", nFlights);
+        drawItem(-1, 160, &FreeSansBold9pt7b, buf);
+        unsigned long idleSec = (millis() - lastWebActivity) / 1000;
+        unsigned long remain = 600;
+        if (idleSec < 600) remain = 600 - idleSec;
+        else remain = 0;
+        sprintf(buf, "Timeout: %02lu:%02lu", remain/60, remain%60);
+        drawItem(-1, 178, &FreeSansBold9pt7b, buf);
     } while (display.nextPage());
 }
 
