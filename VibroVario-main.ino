@@ -1477,6 +1477,11 @@ void loop() {
             showTestResult = false;
             return;
         }
+        if (press[3]) { // UP (BTN4/top-left) → previous row
+            fsm.settingsRow = (fsm.settingsRow + 6) % 7;  // 0..6, wraps
+            showTestResult = false;
+            drawSettings(); return;
+        }
         delay(50);
         break;
     }
