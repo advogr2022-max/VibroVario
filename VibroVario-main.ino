@@ -139,6 +139,7 @@ String testResult;                                   // Last self-test result te
 // NOTE: WiFiServer must be global, constructed before WiFi init (proven pattern)
 WiFiServer webServer(80);
 unsigned long webExportStartTime = 0;
+unsigned long lastWebActivity = 0;                // Last HTTP request time, for idle timeout
 bool webExportActive = false;
 
 // Read altitude using user-set QNH. Wraps BMP library call.
@@ -1045,6 +1046,7 @@ void startWebExport() {
     delay(500);
     webServer.begin();
     webExportStartTime = millis();
+    lastWebActivity = millis();
     webExportActive = true;
     drawWebExport();
 }
@@ -1247,10 +1249,12 @@ void handleSet(WiFiClient &c, String &query) {
     if (newMon >= 1 && newMon <= 12) rtc_mon = newMon;
     // Write all to RTC if any time or date value was provided
     if ((newH >= 0 || newM >= 0 || newD >= 0 || newMon >= 0)) {
+        esp_task_wdt_reset();
         writeDateTimeToRTC(rtc_h, rtc_m, rtc_d, rtc_mon);
     }
     if (newAlt >= 0 && newAlt <= 5000) {
         userAltM = newAlt;
+        esp_task_wdt_reset();
         computeQNHfromAlt(newAlt);
     }
 
@@ -1264,6 +1268,8 @@ void handleSet(WiFiClient &c, String &query) {
 void handleWebClient() {
     WiFiClient client = webServer.available();
     if (!client) return;
+
+    lastWebActivity = millis();  // track activity for idle timeout
 
     // Read request line with 2s timeout to prevent hanging on broken connections
     client.setTimeout(2000);
@@ -1708,6 +1714,15 @@ void loop() {
 
     case FSM_WEB_EXPORT: {
         handleWebClient();
+        // Idle timeout: 10 min without HTTP requests → auto-stop
+        if (webExportActive && (millis() - lastWebActivity > 600000UL)) {
+            webExportActive = false;
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_OFF);
+            readRTC(); drawClock(true);
+            fsm.state = FSM_CLOCK;
+            return;
+        }
         // BACK (press[2], BTN3/bottom-right) → exit early
         // UP (press[3], BTN4/top-left) → exit early (matches "UP - exit" on screen)
         if (press[2] || press[3]) {
