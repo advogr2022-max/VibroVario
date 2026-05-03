@@ -536,7 +536,7 @@ void drawSettings() {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        drawItem(-1, 22, &FreeSansBold18pt7b, "setiings");
+        drawItem(-1, 25, &FreeSansBold18pt7b, "settings");
 
         // Corner labels (same as clock screen)
         display.setFont(&FreeSansBold9pt7b);
