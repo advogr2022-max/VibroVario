@@ -523,10 +523,10 @@ void drawClock(bool fullInit) {
 
         // Button labels in corners (tiny 9pt)
         display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(2, 10);   display.print("1");  // OK (GPIO26)
-        display.setCursor(188, 10); display.print("2");  // UP (GPIO25)
-        display.setCursor(2, 196);  display.print("3");  // EDIT (GPIO4)
-        display.setCursor(188, 196);display.print("4");  // DOWN (GPIO35)
+        display.setCursor(2, 10);   display.print("3");  // EDIT (GPIO4)
+        display.setCursor(188, 10); display.print("4");  // UP (GPIO25)
+        display.setCursor(2, 196);  display.print("2");  // OK (GPIO26)
+        display.setCursor(188, 196);display.print("1");  // CALIBRATE (GPIO35)
     } while (display.nextPage());
 }
 
@@ -715,7 +715,7 @@ void runSelfTest() {
     bool btnStuck[4] = { false, false, false, false };
     delay(10);  // settle after wake
     // Skip BTN_UP [2] — that's the wake button, expected to be held
-    if (!digitalRead(BTN_DOWN)) btnStuck[0] = true;
+    if (!digitalRead(BTN_CALIBRATE)) btnStuck[0] = true;
     if (!digitalRead(BTN_OK))   btnStuck[1] = true;
     if (!digitalRead(BTN_EDIT)) btnStuck[3] = true;
 
@@ -783,7 +783,7 @@ void runSelfTest() {
 String runSelfTestStr() {
     bool btnStuck[3] = { false, false, false };
     delay(10);
-    if (!digitalRead(BTN_DOWN)) btnStuck[0] = true;
+    if (!digitalRead(BTN_CALIBRATE)) btnStuck[0] = true;
     if (!digitalRead(BTN_OK))   btnStuck[1] = true;
 
     bool baroOK = false, accOK = false;
@@ -1255,14 +1255,14 @@ void goDeepSleep() {
     display.hibernate(); Wire.end(); WiFi.mode(WIFI_OFF);
 
     // Wake sources: all 4 buttons (active HIGH, default 0, pressed 1)
-    const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_DOWN) | BIT64(BTN_EDIT);
+    const uint64_t wakeMask = BIT64(BTN_UP) | BIT64(BTN_OK) | BIT64(BTN_CALIBRATE) | BIT64(BTN_EDIT);
     esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
     esp_task_wdt_deinit();
     esp_deep_sleep_start();
 }
 
 void setup() {
-    pinMode(BTN_DOWN, INPUT);
+    pinMode(BTN_CALIBRATE, INPUT);
     pinMode(BTN_OK, INPUT);
     pinMode(BTN_UP, INPUT);
     pinMode(BTN_EDIT, INPUT);
@@ -1348,7 +1348,7 @@ void loop() {
     // === FSM TICK ===
     // Buttons: active HIGH (default LOW=0, pressed HIGH=1)
     // [0]=DOWN (GPIO35), [1]=OK (GPIO26), [2]=UP (GPIO25), [3]=EDIT (GPIO4)
-    bool btn[4] = { digitalRead(BTN_DOWN), digitalRead(BTN_OK), digitalRead(BTN_UP), digitalRead(BTN_EDIT) };
+    bool btn[4] = { digitalRead(BTN_CALIBRATE), digitalRead(BTN_OK), digitalRead(BTN_UP), digitalRead(BTN_EDIT) };
     bool anyBtn = btn[0] || btn[1] || btn[2] || btn[3];
     unsigned long now = millis();
 
@@ -1357,7 +1357,7 @@ void loop() {
     for (int i = 0; i < 4; i++) {
         if (btn[i] && !fsm.lastBtn[i]) {
             delay(50);
-            int p = (i==0 ? BTN_DOWN : (i==1 ? BTN_OK : (i==2 ? BTN_UP : BTN_EDIT)));
+            int p = (i==0 ? BTN_CALIBRATE : (i==1 ? BTN_OK : (i==2 ? BTN_UP : BTN_EDIT)));
             if (digitalRead(p)) { press[i] = true; }
         }
         fsm.lastBtn[i] = btn[i];
@@ -1367,17 +1367,19 @@ void loop() {
     switch (fsm.state) {
 
     case FSM_CLOCK: {
-        // [0]=DOWN (btn4) → settings    [1]=OK (btn1) → fly
-        // [2]=UP (btn2) → sleep          [3]=EDIT (btn3) → no-op
-        if (press[0]) {  // DOWN → settings
+        // [0]=CALIBRATE (btn4/G35/label "4") → fly
+        // [1]=OK (btn1/G26/label "1") → settings
+        // [2]=UP (btn2/G25/label "2") → sleep
+        // [3]=EDIT (btn3/G4/label "3") → no-op
+        if (press[0]) {  // CALIBRATE → start flight
+            fsm.state = FSM_CALIBRATING;
+            startFlight();
+            return;
+        }
+        if (press[1]) {  // OK → settings
             fsm.state = FSM_SETTINGS;
             fsm.settingsRow = 0; fsm.editPhase = 0;
             drawSettings();
-            return;
-        }
-        if (press[1]) {  // OK → start flight
-            fsm.state = FSM_CALIBRATING;
-            startFlight();
             return;
         }
         if (press[2]) {  // UP → sleep
