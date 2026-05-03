@@ -596,7 +596,7 @@ void drawSettings() {
         }
 
         drawItem(-1, 190, &FreeSansBold9pt7b,
-            fsm.editPhase > 0 ? "PRESS2=+  PRESS4=+  PRESS1=save" : "PRESS3=down  PRESS2=back  PRESS1=sel");
+            fsm.editPhase > 0 ? "PRESS4=+  PRESS1=-  PRESS2=ok  PRESS3=back" : "PRESS1=down  PRESS2=sel  PRESS3=back");
     } while (display.nextPage());
 }
 
@@ -1367,21 +1367,21 @@ void loop() {
     switch (fsm.state) {
 
     case FSM_CLOCK: {
-        // [0]=BTN1 (G26/bottom-left) → settings
-        // [1]=BTN2 (G25/top-right) → sleep
-        // [2]=BTN3 (G35/bottom-right) → fly
-        // [3]=BTN4 (G4/top-left) → no-op
-        if (press[0]) {  // BTN1 → settings
+        // [0]=DOWN (BTN1/G26/bottom-left) → fly
+        // [1]=CONFIRM (BTN2/G25/top-right) → settings
+        // [2]=BACK (BTN3/G35/bottom-right) → sleep
+        // [3]=UP (BTN4/G4/top-left) → no-op
+        if (press[1]) {  // CONFIRM → settings
             fsm.state = FSM_SETTINGS;
             fsm.settingsRow = 0; fsm.editPhase = 0;
             drawSettings();
             return;
         }
-        if (press[1]) {  // BTN2 → sleep
+        if (press[2]) {  // BACK → sleep
             setRTCAlarmSec(CLOCK_SLEEP_STILL);
             goDeepSleep();
         }
-        if (press[2]) {  // BTN3 → start flight
+        if (press[0]) {  // DOWN → start flight
             fsm.state = FSM_CALIBRATING;
             startFlight();
             return;
@@ -1403,8 +1403,8 @@ void loop() {
     case FSM_SETTINGS: {
         // Edit mode (time or QNH adjustment active)
         if (fsm.editPhase > 0) {
-            // BTN4 (press[3], top-left) or BTN2 (press[1], top-right) → increase
-            if (press[3] || press[1]) {
+            // UP (press[3], BTN4/top-left) → increase
+            if (press[3]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 1) % 24;
                     else rtc_m = (rtc_m + 1) % 60;
@@ -1416,8 +1416,8 @@ void loop() {
                 }
                 drawSettings(); return;
             }
-            // BTN3 (press[2], bottom-right) → decrease
-            if (press[2]) {
+            // DOWN (press[0], BTN1/bottom-left) → decrease
+            if (press[0]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) rtc_h = (rtc_h + 23) % 24;
                     else rtc_m = (rtc_m + 59) % 60;
@@ -1429,8 +1429,8 @@ void loop() {
                 }
                 drawSettings(); return;
             }
-            // BTN1 (press[0], bottom-left) → save
-            if (press[0]) {
+            // CONFIRM (press[1], BTN2/top-right) → save
+            if (press[1]) {
                 if (fsm.settingsRow == 2) {
                     if (fsm.editPhase == 1) fsm.editPhase = 2;
                     else { writeTimeToRTC(rtc_h, rtc_m); fsm.editPhase = 0; }
@@ -1442,11 +1442,16 @@ void loop() {
                 }
                 drawSettings(); return;
             }
+            // BACK (press[2], BTN3/bottom-right) → cancel edit
+            if (press[2]) {
+                fsm.editPhase = 0;
+                drawSettings(); return;
+            }
             delay(50); break;
         }
 
         // Normal settings navigation
-        if (press[0]) { // BTN1 (bottom-left) → select current row
+        if (press[1]) { // CONFIRM (BTN2/top-right) → select current row
             if (fsm.settingsRow == 0) { buzzerEnabled = !buzzerEnabled; drawSettings(); return; }
             if (fsm.settingsRow == 1) { vibroEnabled = !vibroEnabled; drawSettings(); return; }
             if (fsm.settingsRow == 2) { fsm.editPhase = 1; drawSettings(); return; }
@@ -1463,12 +1468,12 @@ void loop() {
                 drawSettings(); return;
             }
         }
-        if (press[2]) { // BTN3 (bottom-right) → next row
+        if (press[0]) { // DOWN (BTN1/bottom-left) → next row
             fsm.settingsRow = (fsm.settingsRow + 1) % 7;  // 0..6
             showTestResult = false;
             drawSettings(); return;
         }
-        if (press[1]) { // BTN2 (top-right) → back to clock
+        if (press[2]) { // BACK (BTN3/bottom-right) → back to clock
             readRTC(); drawClock(true);
             fsm.state = FSM_CLOCK;
             fsm.editPhase = 0;
@@ -1488,7 +1493,7 @@ void loop() {
 
     case FSM_RUNNING: {
         // RUNNING: varioTask is active on core 0, loop handles UI and auto-landing.
-        // BTN2(press[1], top-right)=emergency stop, BTN1(press[0], bottom-left)=pause+stats, BTN3(press[2])=ignored.
+        // BACK (press[2], BTN3/bottom-right)=emergency stop, CONFIRM (press[1], BTN2/top-right)=pause+stats, DOWN( press[0])=ignored.
         // Track flag enables max/min recording after 5s stabilization.
         // Ensure vario task exists
         if (!vTaskH) {
@@ -1496,8 +1501,8 @@ void loop() {
             drawClock(true);
             return;
         }
-        // BTN2 (press[1], top-right) → stop flight, back to clock
-        if (press[1]) {
+        // BACK (press[2], BTN3/bottom-right) → stop flight, back to clock
+        if (press[2]) {
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
@@ -1507,8 +1512,8 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        // BTN1 (press[0], bottom-left) → stop flight, show stats
-        if (press[0]) {
+        // CONFIRM (press[1], BTN2/top-right) → stop flight, show stats
+        if (press[1]) {
             stopwatchElapsed += (now - data.tStart) / 1000;
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
@@ -1558,9 +1563,9 @@ void loop() {
     }
 
     case FSM_STOPPED:
-        // STOPPED: flight timer frozen, stats displayed. BTN1(press[0])=reset RTC, BTN2(press[1])=clock, BTN3(press[2])=restart.
-        // BTN2 (press[1], top-right) → clock
-        if (press[1]) {
+        // STOPPED: flight timer frozen, stats displayed. BACK(press[2])=clock, CONFIRM(press[1])=reset RTC, DOWN(press[0])=restart.
+        // BACK (press[2], BTN3/bottom-right) → clock
+        if (press[2]) {
             if(vTaskH) { vfsm.running = false; delay(50); vTaskDelete(vTaskH); vTaskH = NULL; }
             digitalWrite(PIN_VARIO_EN, 0);
             digitalWrite(PIN_VIBRO, 0);
@@ -1570,8 +1575,8 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        // BTN1 (press[0], bottom-left) → reset RTC to 00:00
-        if (press[0]) {
+        // CONFIRM (press[1], BTN2/top-right) → reset RTC to 00:00
+        if (press[1]) {
             i2cWrite(ADDR_RTC, 0x02, 0);
             i2cWrite(ADDR_RTC, 0x03, 0);
             i2cWrite(ADDR_RTC, 0x04, 0);
@@ -1580,7 +1585,7 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        if (press[2]) { // BTN3 (bottom-right) → new flight
+        if (press[0]) { // DOWN (BTN1/bottom-left) → new flight
             startFlight();
             return;
         }
@@ -1602,8 +1607,8 @@ void loop() {
             fsm.state = FSM_CLOCK;
             return;
         }
-        // BTN2 (press[1], top-right) → exit early
-        if (press[1]) {
+        // BACK (press[2], BTN3/bottom-right) → exit early
+        if (press[2]) {
             webExportActive = false;
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_OFF);
