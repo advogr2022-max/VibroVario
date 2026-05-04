@@ -110,6 +110,8 @@ struct VarioFsm {
 struct FsmRuntime {
     FsmState state;
     bool lastBtn[4];
+    bool debounceActive[4];     // true while debounce timer is running
+    unsigned long debounceStart[4];  // millis() when rising edge was detected
     int settingsRow;       // 0-5: buzzer, vibro, time, alt, wifi, sensitivity
     int editPhase;         // 0=idle, 1=editing hours/high byte, 2=editing minutes/low byte, 3=editing sensitivity
 } fsm;
@@ -1469,12 +1471,20 @@ void loop() {
     bool anyBtn = btn[0] || btn[1] || btn[2] || btn[3];
     unsigned long now = millis();
 
-    // Rising-edge detection with 50ms debounce delay.
+    // Rising-edge detection with non-blocking 50ms debounce timer.
+    // Instead of delay(50), we use debounceActive[] + debounceStart[]
+    // so the loop() never blocks — WDT keeps resetting, web server stays responsive.
     bool press[4] = { false, false, false, false };
     for (int i = 0; i < 4; i++) {
-        if (btn[i] && !fsm.lastBtn[i]) {
-            delay(50);
-            int p = (i==0 ? BTN1 : (i==1 ? BTN2 : (i==2 ? BTN3 : BTN4)));
+        int p = (i==0 ? BTN1 : (i==1 ? BTN2 : (i==2 ? BTN3 : BTN4)));
+        if (btn[i] && !fsm.lastBtn[i] && !fsm.debounceActive[i]) {
+            // Rising edge detected — start debounce timer
+            fsm.debounceActive[i] = true;
+            fsm.debounceStart[i] = now;
+        }
+        if (fsm.debounceActive[i] && (now - fsm.debounceStart[i] >= 50)) {
+            // Debounce window elapsed — confirm press
+            fsm.debounceActive[i] = false;
             if (digitalRead(p)) { press[i] = true; }
         }
         fsm.lastBtn[i] = btn[i];
@@ -1681,7 +1691,6 @@ void loop() {
         if (now - data.tScreen >= REFRESH_MS) {
             data.tScreen = now; drawMain();
         }
-        delay(10);
         break;
     }
 
@@ -1716,7 +1725,6 @@ void loop() {
         if (now - data.tScreen >= REFRESH_MS) {
             data.tScreen = now; drawMain();
         }
-        delay(10);
         break;
 
     case FSM_WEB_EXPORT: {
@@ -1745,7 +1753,6 @@ void loop() {
             lastWebScreen = now;
             drawWebExport();
         }
-        delay(10);
         break;
     }
     }
