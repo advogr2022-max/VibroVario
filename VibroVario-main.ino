@@ -1520,9 +1520,8 @@ void loop() {
             setRTCAlarmSec(CLOCK_SLEEP_STILL);
             goDeepSleep();
         } else {
-            // Button was pressed but not handled (shouldn't happen) — sleep anyway
-            setRTCAlarmSec(CLOCK_SLEEP_MOTION);
-            goDeepSleep();
+            // Button pressed but debounce not yet confirmed — wait for next tick
+            return;
         }
         break;
     }
@@ -1725,6 +1724,7 @@ void loop() {
         if (now - data.tScreen >= REFRESH_MS) {
             data.tScreen = now; drawMain();
         }
+        delay(10);
         break;
 
     case FSM_WEB_EXPORT: {
@@ -1753,6 +1753,7 @@ void loop() {
             lastWebScreen = now;
             drawWebExport();
         }
+        delay(10);
         break;
     }
     }
